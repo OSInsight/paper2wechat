@@ -7,7 +7,7 @@ content adaptation, and image processing.
 """
 
 __version__ = "0.1.0"
-__author__ = "Your Name"
+__author__ = "OSInsight"
 __license__ = "MIT"
 
 from .models import Article, Paper

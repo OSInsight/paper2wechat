@@ -43,6 +43,66 @@ class TestArticle:
         assert "Test content paragraph 1" in markdown
         assert "This is a test" in markdown
 
+    def test_to_markdown_inserts_images_inline(self):
+        """Selected images should be distributed in content, not only appended at bottom."""
+        article = Article(
+            title="Test Article",
+            content=(
+                "## 论文速览\n"
+                "intro text\n\n"
+                "## 方法拆解\n"
+                "method text\n\n"
+                "## 实验结果\n"
+                "result text"
+            ),
+            style="academic-tech",
+            images=[
+                ImageInfo(
+                    url="assets/x1.png",
+                    caption="Figure 1: System Architecture",
+                    position=1,
+                    is_selected=True,
+                ),
+                ImageInfo(
+                    url="assets/x2.png",
+                    caption="Figure 2: Performance on benchmark",
+                    position=2,
+                    is_selected=True,
+                ),
+            ],
+        )
+
+        markdown = article.to_markdown()
+        assert "## Figures" not in markdown
+        assert markdown.count("![") == 2
+        assert "assets/x1.png" in markdown
+        assert "assets/x2.png" in markdown
+        assert markdown.find("assets/x1.png") < markdown.find("## 实验结果")
+
+    def test_to_markdown_does_not_duplicate_existing_images(self):
+        """If content already includes image markdown, do not inject duplicates."""
+        article = Article(
+            title="Test Article",
+            content=(
+                "## 论文速览\n"
+                "text\n\n"
+                "![inline](assets/existing.png)\n"
+                "_inline_"
+            ),
+            style="academic-tech",
+            images=[
+                ImageInfo(
+                    url="assets/x1.png",
+                    caption="Figure 1: System Architecture",
+                    position=1,
+                    is_selected=True,
+                )
+            ],
+        )
+        markdown = article.to_markdown()
+        assert markdown.count("![") == 1
+        assert "assets/existing.png" in markdown
+
 
 class TestPaper:
     """Test Paper model"""

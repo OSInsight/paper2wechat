@@ -2,6 +2,7 @@
 CLI interface for paper2wechat
 """
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -75,6 +76,12 @@ def create_parser() -> argparse.ArgumentParser:
         default=".paper2wechat",
         help="Cache directory for downloads and parsed content"
     )
+
+    parser.add_argument(
+        "--allow-rule-based",
+        action="store_true",
+        help="Allow rule-based fallback rewriting when no LLM API key is configured",
+    )
     
     return parser
 
@@ -83,6 +90,16 @@ def main():
     """Main CLI entry point"""
     parser = create_parser()
     args = parser.parse_args()
+
+    if not args.allow_rule_based and not _has_llm_api_key():
+        print(
+            "Error: no LLM API key found for CLI mode.\n"
+            "Set OPENROUTER_API_KEY (recommended) or ANTHROPIC_API_KEY.\n"
+            "If you still want low-quality rule-based fallback, add --allow-rule-based.\n"
+            "For chat-agent workflow without API key, use skill agent flow instead of raw CLI.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     converter = PaperConverter(
         style=args.style,
@@ -148,6 +165,10 @@ def _default_output_path(source: str) -> Path:
 
     stem = _derive_output_stem(source)
     return output_dir / f"{stem}.md"
+
+
+def _has_llm_api_key() -> bool:
+    return bool(os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY"))
 
 
 def _derive_output_stem(source: str) -> str:

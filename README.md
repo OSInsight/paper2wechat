@@ -2,6 +2,10 @@
 
 Convert Arxiv papers to WeChat Official Account articles with practical summarization, PDF image extraction, and style adaptation.
 
+> **🤖 For AI Agents**: If you're an AI assistant helping a user with this tool, see [`.claude/skills/paper2wechat/SKILL.md`](.claude/skills/paper2wechat/SKILL.md) for agent-specific instructions.
+>
+> **👤 For Human Users**: Continue reading below for CLI, API, and development documentation.
+
 [中文版本](README.zh.md)
 
 ## ✨ Features
@@ -24,7 +28,7 @@ Convert Arxiv papers to WeChat Official Account articles with practical summariz
 pip install paper2wechat
 
 # From source
-git clone https://github.com/yourusername/paper2wechat.git
+git clone https://github.com/OSInsight/paper2wechat.git
 cd paper2wechat
 pip install -e .
 ```
@@ -52,6 +56,9 @@ paper2wechat https://arxiv.org/abs/2301.00000 --draft --cover
 # From local PDF
 paper2wechat ./paper.pdf --style academic-science
 ```
+
+Note: CLI mode requires `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY` by default.  
+If you explicitly accept lower-quality rule-based rewriting, add `--allow-rule-based`.
 
 #### 2. Python API
 
@@ -92,6 +99,14 @@ Claude: [Using paper2wechat skill to process]
 5. Ready for preview or publishing
 ```
 
+You can also use agent mode (no manual CLI parameter wiring):
+
+```bash
+bash skills/paper2wechat/scripts/run.sh agent "Convert this paper to a WeChat post: https://arxiv.org/abs/2510.21603"
+```
+
+In chat-agent workflow, API key is not mandatory; the coding agent can write the final Chinese article from parsed context.
+
 ## 🎯 Architecture
 
 ```
@@ -114,7 +129,6 @@ Output: .md file → [md2wechat] → WeChat article
 
 ## 📚 Documentation
 
-- [QUICKSTART.md](QUICKSTART.md) - 5-minute guide to get started
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Full architecture explanation
 - [docs/API.md](docs/API.md) - Python API reference
 - [docs/STYLES.md](docs/STYLES.md) - Style definitions and examples
@@ -158,6 +172,17 @@ By default, generated artifacts are saved in:
 ### Environment Variables
 
 ```bash
+# For LLM rewriting (recommended)
+export OPENROUTER_API_KEY=your_openrouter_key
+export OPENROUTER_MODEL=anthropic/claude-3.5-sonnet
+# Optional: custom OpenRouter endpoint and app identity headers
+export OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+export OPENROUTER_SITE_URL=https://your-site.example
+export OPENROUTER_APP_NAME=paper2wechat
+
+# Optional fallback for direct Anthropic API
+export ANTHROPIC_API_KEY=your_anthropic_key
+
 # For WeChat publishing (optional)
 export WECHAT_APPID=your_appid
 export WECHAT_SECRET=your_secret
@@ -195,7 +220,6 @@ defaults:
 paper2wechat/
 ├── CLAUDE.md                         # Design document for AI
 ├── README.md                         # This file
-├── QUICKSTART.md                     # Quick start guide
 ├── setup.py                          # Python package setup
 ├── requirements.txt                  # Dependencies
 │

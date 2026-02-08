@@ -46,4 +46,4 @@ Generated `example-output.md` contains:
 
 ---
 
-See [QUICKSTART.md](../QUICKSTART.md) for more examples.
+See [README.md](../README.md) for more examples.

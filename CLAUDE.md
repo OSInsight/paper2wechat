@@ -404,7 +404,7 @@ class PaperFetcher:
 ```
 文档：
 ✅ README.md - 项目概述、特性、安装
-✅ QUICKSTART.md - 5分钟快速开始
+✅ README.md - 包含快速开始指南
 ✅ docs/ARCHITECTURE.md - 架构详解
 ✅ docs/API.md - Python API 文档
 ✅ SKILL.md - Skill 文档
@@ -461,7 +461,64 @@ class PaperFetcher:
 
 ---
 
-## 📞 后续开发指南
+## � Claude Code 集成指南
+
+paper2wechat 采用独特的架构实现 Claude Code 集成：**完全由 Claude 的文本生成能力完成，不依赖任何外部代码执行**。
+
+### 集成方式
+
+**SKILL.md 文件** (`.claude/skills/paper2wechat/SKILL.md`)
+- 解释 Claude 在 Claude Code 中如何工作
+- 描述论文提取、内容改写、文章生成的完整流程
+- 提供自然语言交互指南
+- 强调这是由 Claude 能力完成，不涉及 Python/bash 代码执行
+
+### 用户体验
+
+用户在 Claude Code 中直接与 AI 对话：
+
+```
+"Convert this paper to a WeChat article: https://arxiv.org/abs/2510.21603"
+"Rewrite this PDF in academic-tech style, keep it brief"
+"Turn this research into content for business-minded WeChat followers"
+```
+
+### Claude 的处理步骤
+
+1. **解析用户意图** - 理解论文来源、期望风格、长度偏好
+2. **提取论文内容** - 从 Arxiv 或本地 PDF 获取关键信息
+3. **分析和理解** - 深入理解核心问题、创新点、实际意义
+4. **创意改写** - 用自身文本生成能力，将学术内容转换为微信友好的文章
+5. **生成 Markdown** - 输出格式化的 Markdown，可直接使用
+6. **反馈和保存** - 告知用户结果、路径和统计信息
+
+### 为什么不执行代码？
+
+paper2wechat 项目中有 Python 工具（converter.py 等），但在 Claude Code 中：
+- **不调用** Python 脚本或 CLI
+- **不需要** API key 配置
+- **完全依赖** Claude 的文本生成和理解能力
+- **更简洁** - 用户只需提供论文 URL 或文件
+
+这样的设计：
+- ✅ 用户体验流畅（纯对话，无配置）
+- ✅ 减少依赖（不需要安装 Python 包）
+- ✅ 降低犯错风险（不执行外部代码）
+- ✅ 充分利用 Claude 的 AI 能力
+
+### 与其他模式的区别
+
+paper2wechat 支持多种使用方式：
+
+| 方式                   | 执行方式            | 适合场景                 |
+| ---------------------- | ------------------- | ------------------------ |
+| **Claude Code (推荐)** | Claude 直接生成文章 | 快速、简洁、无需配置     |
+| **Python CLI**         | 调用 converter.py   | 批量处理、需要高质量输出 |
+| **Python API**         | 程序集成            | 应用内部使用             |
+
+---
+
+## �📞 后续开发指南
 
 ### Q: 我在新项目中和你对话时，应该怎么使用本文档？
 **A**: 只需告诉我"按照 paper2wechat 项目设计继续"，或指定具体功能模块，我会自动参考此文档快速上下文。

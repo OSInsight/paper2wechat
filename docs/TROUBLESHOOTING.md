@@ -260,7 +260,7 @@ paper2wechat ...
 Still stuck? Try these:
 
 1. **Check documentation**:
-   - [QUICKSTART.md](../QUICKSTART.md)
+   - [README.md](../README.md)
    - [CLAUDE.md](../CLAUDE.md) - Design document
    - [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 

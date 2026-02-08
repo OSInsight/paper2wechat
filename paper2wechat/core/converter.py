@@ -3,12 +3,13 @@ Main converter class for paper2wechat
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import shutil
 from pathlib import Path
 from typing import Optional, List
 from .models import Article
-from .paper_fetcher import PaperFetcher
+from .paper_fetcher import FetchError, PaperFetcher
 from .content_adapter import ContentAdapter
 from .image_processor import ImageProcessor
 from .markdown_generator import MarkdownGenerator
@@ -54,13 +55,19 @@ class PaperConverter:
         Returns:
             Article object
         """
-        # Fetch paper
-        paper = self.fetcher.fetch_from_url(url)
+        # Fetch paper (with local-cache fallback when network is unavailable).
+        try:
+            paper = self.fetcher.fetch_from_url(url)
+        except Exception as exc:
+            paper = self._load_from_local_cache_if_possible(url, exc)
         
         # Adapt content
         adapted_content = self.adapter.adapt(
             paper.full_text,
-            max_length=self.max_length
+            max_length=self.max_length,
+            title=paper.title,
+            abstract=paper.abstract,
+            sections=paper.sections,
         )
         
         # Process images
@@ -76,7 +83,7 @@ class PaperConverter:
             style=self.style,
             original_paper=paper,
             images=selected_images,
-            summary=paper.abstract,
+            summary=self._derive_summary(adapted_content),
             word_count=len(adapted_content.split()),
         )
         
@@ -85,6 +92,28 @@ class PaperConverter:
             article.save_markdown(output_path)
         
         return article
+
+    def _load_from_local_cache_if_possible(self, url: str, original_error: Exception):
+        try:
+            arxiv_id = PaperFetcher.parse_arxiv_url(url)
+        except ValueError as parse_error:
+            raise original_error from parse_error
+
+        safe_id = arxiv_id.replace("/", "_")
+        local_pdf = Path(self.cache_dir) / "downloads" / f"{safe_id}.pdf"
+        if not local_pdf.exists() or local_pdf.stat().st_size <= 0:
+            raise original_error
+
+        try:
+            return self.fetcher.fetch_from_pdf(
+                str(local_pdf),
+                arxiv_id=arxiv_id,
+                source_url=url,
+            )
+        except Exception as cache_error:
+            raise FetchError(
+                f"Failed to fetch from URL and local cache fallback also failed: {url}"
+            ) from cache_error
     
     def convert_pdf(self, pdf_path: str, output_path: Optional[str] = None) -> Article:
         """
@@ -103,7 +132,10 @@ class PaperConverter:
         # Same as convert() from here
         adapted_content = self.adapter.adapt(
             paper.full_text,
-            max_length=self.max_length
+            max_length=self.max_length,
+            title=paper.title,
+            abstract=paper.abstract,
+            sections=paper.sections,
         )
         
         selected_images = self.image_processor.select_images(
@@ -117,7 +149,7 @@ class PaperConverter:
             style=self.style,
             original_paper=paper,
             images=selected_images,
-            summary=paper.abstract,
+            summary=self._derive_summary(adapted_content),
             word_count=len(adapted_content.split()),
         )
         
@@ -211,3 +243,30 @@ class PaperConverter:
                 shutil.copyfile(source, target)
 
             image.url = str(target.relative_to(md_path.parent).as_posix())
+
+    @staticmethod
+    def _derive_summary(adapted_content: str, max_chars: int = 180) -> str:
+        lines = [line.strip() for line in adapted_content.splitlines() if line.strip()]
+        candidate = ""
+        for line in lines:
+            if line.startswith(("这篇论文", "本文")):
+                candidate = line
+                break
+
+        for line in lines:
+            if candidate:
+                break
+            if line.startswith("#"):
+                continue
+            if line.startswith("- "):
+                continue
+            candidate = line
+            break
+
+        if not candidate:
+            candidate = lines[0] if lines else ""
+
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if len(candidate) > max_chars:
+            candidate = candidate[: max_chars - 1].rstrip() + "…"
+        return candidate

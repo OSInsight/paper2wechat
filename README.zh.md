@@ -2,6 +2,10 @@
 
 将 Arxiv 论文转换为微信公众号文章，具备实用摘要、PDF 图片提取和风格自适应能力。
 
+> **🤖 给 AI Agent**: 如果你是帮助用户使用此工具的 AI 助手，请查看 [`.claude/skills/paper2wechat/SKILL.md`](.claude/skills/paper2wechat/SKILL.md) 了解 Agent 专用指令。
+>
+> **👤 给人类用户**: 继续阅读下面的 CLI、API 和开发文档。
+
 [English Version](README.md)
 
 ## ✨ 功能特点
@@ -21,7 +25,7 @@
 
 ```bash
 # 从源代码安装
-git clone https://github.com/yourusername/paper2wechat.git
+git clone https://github.com/OSInsight/paper2wechat.git
 cd paper2wechat
 pip install -e .
 ```
@@ -49,6 +53,9 @@ paper2wechat https://arxiv.org/abs/2301.00000 --draft --cover
 # 从本地 PDF
 paper2wechat ./paper.pdf --style academic-science
 ```
+
+说明：CLI 默认要求你配置 `OPENROUTER_API_KEY` 或 `ANTHROPIC_API_KEY`。  
+如果你明确接受低质量规则改写，可加 `--allow-rule-based`。
 
 #### 2. Python API
 
@@ -89,6 +96,14 @@ Claude: [使用 paper2wechat skill 处理]
 5. 准备预览或发布
 ```
 
+也可以直接用 Agent 自动模式（无需手工拼 CLI 参数）：
+
+```bash
+bash skills/paper2wechat/scripts/run.sh agent "把这篇论文转公众号：https://arxiv.org/abs/2510.21603"
+```
+
+对话式 Agent 工作流不强制你提供 API Key；Agent 可基于解析结果直接生成中文稿件。
+
 ## 🎯 架构
 
 ```
@@ -111,7 +126,7 @@ Arxiv URL/PDF
 
 ## 📚 文档
 
-- [快速开始指南](QUICKSTART.md) - 5分钟快速上手
+
 - [文档/架构说明](docs/ARCHITECTURE.md) - 完整架构解释
 - [文档/API 参考](docs/API.md) - Python API 文档
 - [文档/风格定义](docs/STYLES.md) - 风格定义和示例
@@ -156,6 +171,17 @@ bash md2wechat/scripts/run.sh convert outputs/article.md --draft --cover cover.j
 ### 环境变量
 
 ```bash
+# 用于 LLM 改写（推荐）
+export OPENROUTER_API_KEY=your_openrouter_key
+export OPENROUTER_MODEL=anthropic/claude-3.5-sonnet
+# 可选：自定义 OpenRouter 地址和应用标识
+export OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+export OPENROUTER_SITE_URL=https://your-site.example
+export OPENROUTER_APP_NAME=paper2wechat
+
+# 可选：直连 Anthropic（当未配置 OpenRouter 时回退）
+export ANTHROPIC_API_KEY=your_anthropic_key
+
 # 用于微信发布（可选）
 export WECHAT_APPID=your_appid
 export WECHAT_SECRET=your_secret
@@ -174,6 +200,11 @@ wechat:
   appid: your_appid
   secret: your_secret
 
+image:
+  api_key: your_key
+  max_width: 1920
+  auto_compress: true
+
 defaults:
   style: academic-tech
   max_images: 5
@@ -186,7 +217,6 @@ paper2wechat/
 ├── CLAUDE.md                         # AI 设计文档
 ├── README.md                         # 英文说明
 ├── README.zh.md                      # 中文说明
-├── QUICKSTART.md                     # 快速开始
 ├── setup.py                          # Python 包配置
 ├── requirements.txt                  # 依赖
 │

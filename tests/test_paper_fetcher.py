@@ -75,3 +75,47 @@ class TestPaperFetcher:
         assert len(images) == 1
         assert images[0].url.endswith(".png")
         assert Path(images[0].url).exists()
+
+    def test_normalize_page_text(self):
+        """Test page text normalization keeps line structure"""
+        raw = "Title\\n\\nAbstract\\nLine one -\\ncontinued\\n\\n3\\n"
+        normalized = PaperFetcher._normalize_page_text(raw)
+        assert "continued" in normalized
+        assert "3" not in normalized.splitlines()
+
+    def test_select_plumber_bbox_merges_fragments(self):
+        """Fragmented image blocks should be merged into one figure box."""
+        boxes = [
+            {"x0": 120, "x1": 240, "top": 300, "bottom": 420},
+            {"x0": 250, "x1": 370, "top": 300, "bottom": 420},
+            {"x0": 380, "x1": 500, "top": 300, "bottom": 420},
+            {"x0": 510, "x1": 630, "top": 300, "bottom": 420},
+        ]
+        rect = PaperFetcher._select_plumber_figure_bbox(
+            caption_top=520,
+            page_width=1000,
+            page_height=1400,
+            header_cutoff=140,
+            image_boxes=boxes,
+        )
+        assert rect is not None
+        x0, top, x1, bottom = rect
+        assert top >= 140
+        assert bottom <= 518
+        assert x1 - x0 >= 500
+
+    def test_select_plumber_bbox_fallback_is_narrower(self):
+        """Fallback area should avoid capturing excessive page header."""
+        rect = PaperFetcher._select_plumber_figure_bbox(
+            caption_top=400,
+            page_width=1000,
+            page_height=1000,
+            header_cutoff=100,
+            image_boxes=[],
+        )
+        assert rect is not None
+        x0, top, x1, bottom = rect
+        assert x0 == 80
+        assert x1 == 920
+        assert top == 100
+        assert bottom == 394

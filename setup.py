@@ -6,12 +6,12 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name="paper2wechat",
     version="0.1.0",
-    author="Your Name",
-    author_email="your.email@example.com",
+    author="OSInsight",
+    author_email="hello@osinsight.io",
     description="Convert Arxiv papers to WeChat Official Account articles with AI",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/paper2wechat",
+    url="https://github.com/OSInsight/paper2wechat",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -32,6 +32,7 @@ setup(
         "pydantic-settings>=2.0.0",
         "pdfplumber>=0.9.0",
         "pypdf>=3.0.0",
+        "PyMuPDF>=1.24.0",
         "PyYAML>=6.0",
         "anthropic>=0.7.0",
     ],

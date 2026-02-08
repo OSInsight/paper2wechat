@@ -6,7 +6,7 @@
 
 A: Clone the repository and install:
 ```bash
-git clone https://github.com/yourusername/paper2wechat.git
+git clone https://github.com/OSInsight/paper2wechat.git
 cd paper2wechat
 pip install -e .
 ```
@@ -104,5 +104,5 @@ A: Yes! Submit a PR with your style prompt and example outputs.
 
 For more help, see:
 - [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Detailed troubleshooting
-- [QUICKSTART.md](../QUICKSTART.md) - Getting started
+- [README.md](../README.md) - Getting started
 - Open an issue on GitHub
