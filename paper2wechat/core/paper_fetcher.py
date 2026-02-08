@@ -170,6 +170,14 @@ class PaperFetcher:
                 cache_key=cache_key,
             )
         if not images:
+            # Last-resort fallback: avoid exporting all embedded images (often many tiny fragments).
+            # Prefer extracting a small number of large figure-like regions.
+            images = self._extract_largest_figures_with_fitz(
+                pdf_path=pdf_file,
+                cache_key=cache_key,
+                max_images=8,
+            )
+        if not images:
             images = self._extract_pdf_images(reader, cache_key=cache_key)
 
         paper = Paper(
@@ -185,6 +193,102 @@ class PaperFetcher:
 
         self._save_parsed_cache(paper, cache_key=cache_key)
         return paper
+
+    def _extract_largest_figures_with_fitz(
+        self,
+        pdf_path: Path,
+        cache_key: str,
+        max_images: int = 8,
+    ) -> List[ImageInfo]:
+        """Fallback extractor: pick a bounded set of large image regions.
+
+        Some PDFs don't expose Figure captions cleanly, and exporting all embedded
+        images yields many tiny fragments (icons, glyphs, patches). This method
+        uses PyMuPDF's image rectangles to crop only the largest regions.
+        """
+        if fitz is None or max_images <= 0:
+            return []
+
+        paper_image_dir = self._prepare_image_dir(cache_key=cache_key, reset=True)
+        extracted: List[ImageInfo] = []
+
+        try:
+            document = fitz.open(str(pdf_path))
+        except Exception:
+            return []
+
+        try:
+            candidates: List[tuple[float, int, Any]] = []  # (area, page_index, rect)
+            for page_index in range(document.page_count):
+                page = document.load_page(page_index)
+                page_rect = page.rect
+                header_cutoff = page_rect.y0 + page_rect.height * 0.10
+                rects = self._collect_fitz_image_rects(page)
+                for rect in rects:
+                    if rect.y0 < header_cutoff:
+                        continue
+                    if rect.width < page_rect.width * 0.20:
+                        continue
+                    if rect.height < page_rect.height * 0.06:
+                        continue
+                    area = rect.width * rect.height
+                    candidates.append((area, page_index, rect))
+
+            if not candidates:
+                return []
+
+            # Keep only the largest regions overall.
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            selected = candidates[: max_images * 2]  # extra for dedup/size filters
+
+            seq = 1
+            for _, page_index, rect in selected:
+                page = document.load_page(page_index)
+                page_rect = page.rect
+                header_cutoff = page_rect.y0 + page_rect.height * 0.10
+
+                pad_x = max(page_rect.width * 0.01, rect.width * 0.02)
+                pad_y = max(page_rect.height * 0.01, rect.height * 0.03)
+                clip = fitz.Rect(
+                    max(page_rect.x0, rect.x0 - pad_x),
+                    max(header_cutoff, rect.y0 - pad_y),
+                    min(page_rect.x1, rect.x1 + pad_x),
+                    min(page_rect.y1, rect.y1 + pad_y),
+                )
+
+                try:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), clip=clip, alpha=False)
+                except Exception:
+                    continue
+
+                if pix.width * pix.height < 220000:
+                    continue
+
+                output_path = paper_image_dir / f"page_{page_index + 1:03d}_{seq:03d}.png"
+                try:
+                    pix.save(str(output_path))
+                except Exception:
+                    continue
+
+                extracted.append(
+                    ImageInfo(
+                        url=str(output_path.as_posix()),
+                        caption=f"Figure (page {page_index + 1})",
+                        position=seq,
+                        relevance_score=self._estimate_caption_image_relevance(
+                            page_index=page_index,
+                            clip_height=clip.height,
+                        ),
+                    )
+                )
+                seq += 1
+
+                if len(extracted) >= max_images:
+                    break
+        finally:
+            document.close()
+
+        return self._deduplicate_images(extracted)
     
     @staticmethod
     def parse_arxiv_url(url: str) -> str:
@@ -481,6 +585,10 @@ class PaperFetcher:
 
                 page_rect = page.rect
                 header_cutoff = page_rect.y0 + page_rect.height * 0.10
+                # For aesthetics, we sometimes want a bit of top whitespace.
+                # However, we still must avoid pulling in page headers.
+                header_guard = page_rect.y0 + page_rect.height * 0.06
+                relaxed_header_cutoff = max(header_guard, header_cutoff - page_rect.height * 0.03)
                 image_rects = self._collect_fitz_image_rects(page)
                 for caption in captions:
                     cap_rect = caption["rect"]
@@ -492,12 +600,64 @@ class PaperFetcher:
                     )
                     if clip is None:
                         continue
+
+                    # If the initial bbox is too small (common when the PDF encodes
+                    # diagrams as many small image objects), prefer a broader window
+                    # above the caption.
+                    if clip.width < 120 or clip.height < 80:
+                        alt_top = max(header_cutoff, cap_rect.y0 - page_rect.height * 0.60)
+                        alt_bottom = cap_rect.y0 - 2
+                        alt = fitz.Rect(
+                            page_rect.x0 + page_rect.width * 0.04,
+                            alt_top,
+                            page_rect.x1 - page_rect.width * 0.04,
+                            alt_bottom,
+                        )
+                        if alt.width < 120 or alt.height < 80:
+                            continue
+                        clip = alt
+
+                    # Add a bit of whitespace around the extracted region.
+                    # Keep a small gap above the caption so we don't capture caption text,
+                    # but allow enough breathing room for WeChat layout.
+                    bottom_limit = cap_rect.y0 - max(2.0, page_rect.height * 0.003)
+                    pad_x = max(page_rect.width * 0.012, clip.width * 0.020)
+                    pad_y = max(page_rect.height * 0.012, clip.height * 0.030)
+                    clip = fitz.Rect(
+                        max(page_rect.x0, clip.x0 - pad_x),
+                        max(relaxed_header_cutoff, clip.y0 - pad_y),
+                        min(page_rect.x1, clip.x1 + pad_x),
+                        min(bottom_limit, clip.y1 + pad_y),
+                    )
                     if clip.width < 120 or clip.height < 80:
                         continue
 
                     pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), clip=clip, alpha=False)
                     if pix.width * pix.height < 180000:
-                        continue
+                        # The bbox selection can latch onto a small embedded image close
+                        # to the caption (e.g., icons, panel labels). Retry with a broader
+                        # fallback window above the caption to capture the full figure.
+                        alt_top = max(header_cutoff, cap_rect.y0 - page_rect.height * 0.60)
+                        alt_bottom = cap_rect.y0 - 2
+                        alt = fitz.Rect(
+                            page_rect.x0 + page_rect.width * 0.04,
+                            alt_top,
+                            page_rect.x1 - page_rect.width * 0.04,
+                            alt_bottom,
+                        )
+                        if alt.width < 120 or alt.height < 80:
+                            continue
+
+                        alt_pix = page.get_pixmap(
+                            matrix=fitz.Matrix(2.2, 2.2),
+                            clip=alt,
+                            alpha=False,
+                        )
+                        if alt_pix.width * alt_pix.height < 180000:
+                            continue
+
+                        clip = alt
+                        pix = alt_pix
 
                     output_path = paper_image_dir / f"page_{page_index + 1:03d}_{seq:03d}.png"
                     pix.save(str(output_path))
@@ -544,6 +704,8 @@ class PaperFetcher:
 
                     images = page.images or []
                     header_cutoff = page.height * 0.10
+                    header_guard = page.height * 0.06
+                    relaxed_header_cutoff = max(header_guard, header_cutoff - page.height * 0.03)
                     for caption in captions:
                         cap_top = float(caption["top"])
                         rect = self._select_plumber_figure_bbox(
@@ -557,6 +719,16 @@ class PaperFetcher:
                             continue
 
                         x0, top, x1, bottom = rect
+                        # Add some whitespace around the extracted region.
+                        pad_x = max(float(page.width) * 0.015, (x1 - x0) * 0.02)
+                        pad_y = max(float(page.height) * 0.015, (bottom - top) * 0.03)
+                        bottom_limit = cap_top - max(2.0, float(page.height) * 0.003)
+                        x0 = max(0.0, x0 - pad_x)
+                        x1 = min(float(page.width), x1 + pad_x)
+                        top = max(relaxed_header_cutoff, top - pad_y)
+                        bottom = min(bottom_limit, bottom + pad_y)
+                        if bottom - top < 1:
+                            continue
                         if x1 - x0 < 120 or bottom - top < 80:
                             continue
 
@@ -634,6 +806,44 @@ class PaperFetcher:
 
         if candidates:
             _, _, best = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
+
+            # Merge nearby large rectangles to avoid cropping only one panel of a
+            # multi-panel figure (common when a figure is composed of multiple
+            # image objects).
+            cluster: List[Any] = [best]
+            for rect in image_rects:
+                if rect is best:
+                    continue
+                if rect.y1 > cap_top + 4:
+                    continue
+                if rect.y0 < header_cutoff:
+                    continue
+                if rect.width < page_rect.width * 0.10:
+                    continue
+                if rect.height < page_rect.height * 0.04:
+                    continue
+
+                x_gap = page_rect.width * 0.10
+                if rect.x1 < best.x0 - x_gap or rect.x0 > best.x1 + x_gap:
+                    continue
+
+                overlap = min(rect.y1, best.y1) - max(rect.y0, best.y0)
+                if overlap < min(rect.height, best.height) * 0.12 and abs(rect.y0 - best.y0) > page_rect.height * 0.06:
+                    continue
+
+                cluster.append(rect)
+
+            if len(cluster) >= 2:
+                union_x0 = min(r.x0 for r in cluster)
+                union_y0 = min(r.y0 for r in cluster)
+                union_x1 = max(r.x1 for r in cluster)
+                union_y1 = max(r.y1 for r in cluster)
+                union = fitz.Rect(union_x0, union_y0, union_x1, union_y1)
+                best_area = best.width * best.height
+                union_area = union.width * union.height
+                if union_area >= best_area * 1.20 and union.height <= page_rect.height * 0.72:
+                    best = union
+
             pad_x = page_rect.width * 0.01
             pad_y = page_rect.height * 0.01
             return fitz.Rect(
@@ -669,25 +879,32 @@ class PaperFetcher:
             union_w = union_x1 - union_x0
             union_h = union_y1 - union_y0
             if union_w >= page_rect.width * 0.28 and union_h >= page_rect.height * 0.10:
-                pad_x = page_rect.width * 0.01
-                pad_y = page_rect.height * 0.01
-                return fitz.Rect(
-                    max(page_rect.x0, union_x0 - pad_x),
-                    max(header_cutoff, union_y0 - pad_y),
-                    min(page_rect.x1, union_x1 + pad_x),
-                    min(caption_rect.y0 - 2, union_y1 + pad_y),
-                )
+                # Guard against sparse "fragments" (icons / markers) whose union box
+                # looks large but doesn't cover the actual (often vector) figure.
+                union_area = max(union_w * union_h, 1.0)
+                covered_area = sum(rect.width * rect.height for rect in fragment_pool)
+                coverage = covered_area / union_area
+                if coverage >= 0.40:
+                    pad_x = page_rect.width * 0.01
+                    pad_y = page_rect.height * 0.01
+                    return fitz.Rect(
+                        max(page_rect.x0, union_x0 - pad_x),
+                        max(header_cutoff, union_y0 - pad_y),
+                        min(page_rect.x1, union_x1 + pad_x),
+                        min(caption_rect.y0 - 2, union_y1 + pad_y),
+                    )
 
         # Fallback region if we cannot bind to an image object.
-        top = max(header_cutoff, cap_top - page_rect.height * 0.32)
-        bottom = cap_top - 6
+        # Use a taller window to reduce the chance of cutting off vector-heavy figures.
+        top = max(header_cutoff, cap_top - page_rect.height * 0.55)
+        bottom = cap_top - 2
         if bottom - top < 90:
             return None
 
         return fitz.Rect(
-            page_rect.x0 + page_rect.width * 0.08,
+            page_rect.x0 + page_rect.width * 0.04,
             top,
-            page_rect.x1 - page_rect.width * 0.08,
+            page_rect.x1 - page_rect.width * 0.04,
             bottom,
         )
 
@@ -695,7 +912,11 @@ class PaperFetcher:
     def _find_figure_captions_from_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not words:
             return []
-        pattern = re.compile(r"^(figure|fig\.?)\s*\d+", re.IGNORECASE)
+        # Captions often start with optional panel markers like "(a) (b) (c)",
+        # so we search for Figure/Fig near the beginning of the line.
+        # We also avoid in-paragraph references like "as shown in Figure 1" by
+        # requiring the match to occur close to the start.
+        pattern = re.compile(r"(figure|fig\.?)\s*\d+[\s:._\-]+", re.IGNORECASE)
 
         grouped: Dict[int, List[Dict[str, Any]]] = {}
         for word in words:
@@ -707,14 +928,20 @@ class PaperFetcher:
             sorted_words = sorted(line_words, key=lambda w: float(w.get("x0", 0)))
             text = " ".join(str(w.get("text", "")).strip() for w in sorted_words).strip()
             text = re.sub(r"\s+", " ", text)
-            if not text or not pattern.match(text):
+            if not text:
+                continue
+
+            match = pattern.search(text)
+            if not match:
+                continue
+            if match.start() > 18:
                 continue
 
             top = min(float(w.get("top", 0)) for w in sorted_words)
             bottom = max(float(w.get("bottom", 0)) for w in sorted_words)
             captions.append(
                 {
-                    "text": text[:160],
+                    "text": text[match.start() : match.start() + 160],
                     "top": top,
                     "bottom": bottom,
                 }
@@ -801,7 +1028,7 @@ class PaperFetcher:
                 )
 
         top = max(header_cutoff, caption_top - page_height * 0.32)
-        bottom = caption_top - 6
+        bottom = caption_top - 2
         if bottom - top < 90:
             return None
         return (
@@ -817,7 +1044,9 @@ class PaperFetcher:
             return []
 
         captions: List[Dict[str, Any]] = []
-        pattern = re.compile(r"^(figure|fig\.?)\s*\d+[\s:.\-]+", re.IGNORECASE)
+        # Captions can be prefixed by panel labels like "(a) (b)"; detect Figure/Fig
+        # near the start of the text block and ignore in-paragraph references.
+        pattern = re.compile(r"(figure|fig\.?)\s*\d+[\s:.\-]+", re.IGNORECASE)
 
         try:
             blocks = page.get_text("blocks")
@@ -831,10 +1060,19 @@ class PaperFetcher:
             clean = re.sub(r"\s+", " ", str(text or "")).strip()
             if not clean:
                 continue
-            if not pattern.match(clean):
+
+            match = pattern.search(clean)
+            if not match:
+                continue
+            if match.start() > 18:
                 continue
 
-            captions.append({"text": clean[:160], "rect": fitz.Rect(x0, y0, x1, y1)})
+            captions.append(
+                {
+                    "text": clean[match.start() : match.start() + 160],
+                    "rect": fitz.Rect(x0, y0, x1, y1),
+                }
+            )
 
         captions.sort(key=lambda item: item["rect"].y0)
         return captions

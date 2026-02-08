@@ -12,7 +12,6 @@ from .models import Article
 from .paper_fetcher import FetchError, PaperFetcher
 from .content_adapter import ContentAdapter
 from .image_processor import ImageProcessor
-from .markdown_generator import MarkdownGenerator
 
 
 class PaperConverter:
@@ -42,7 +41,6 @@ class PaperConverter:
         self.fetcher = PaperFetcher(cache_dir=cache_dir)
         self.adapter = ContentAdapter(style=style)
         self.image_processor = ImageProcessor(max_images=max_images)
-        self.markdown_generator = MarkdownGenerator()
     
     def convert(self, url: str, output_path: Optional[str] = None) -> Article:
         """

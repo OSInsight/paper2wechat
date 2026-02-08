@@ -185,7 +185,8 @@ Now use my own writing capabilities to transform this content.
 [Use analogies for complex concepts]
 [Connect to existing knowledge]
 
-[Image reference if available]
+![Descriptive alt text](../.paper2wechat/images/{paper_id}/page_XXX_YYY.png)
+*图1: 清晰的图注说明，解释这个图表展示的核心内容和价值*
 
 ## [Section 3: Results/Impact] 📊
 
@@ -193,7 +194,8 @@ Now use my own writing capabilities to transform this content.
 [What does the data show?]
 [How does it compare to alternatives?]
 
-[Image reference if available]
+![Descriptive alt text](../.paper2wechat/images/{paper_id}/page_XXX_YYY.png)
+*图2: 详细的图注，帮助读者理解数据和实验结果的意义*
 
 ## 启示与应用 🚀
 
@@ -226,6 +228,11 @@ Example:
 4. **Scannable** - Use headings, bullets, and clear structure
 5. **Engaging** - Open with relevance; close with takeaway
 6. **Connected** - Link to reader's world and experience
+7. **Visual context** - Every image needs:
+   - Transitional text before or descriptive context after
+   - Italic caption explaining what the figure shows (*图X: ...*)
+   - Connection to the surrounding narrative
+   - Never insert images abruptly without explanation
 
 ### Keyword Requirement
 
@@ -325,7 +332,7 @@ Progress:
 - [ ] Step 3: Understand core contributions and real-world impact
 - [ ] Step 4: Write article in selected style
 - [ ] Step 4: Follow structure and writing principles
-- [ ] Step 4: Reference extracted images naturally
+- [ ] Step 4: Reference extracted images with proper captions (see Image Guidelines below)
 - [ ] Step 4: Add **关键词** line at the end
 - [ ] Step 5: Save to outputs/ with proper naming
 - [ ] Step 5: Report results to user
@@ -340,12 +347,17 @@ Progress:
    - For PDFs, ensure file is readable
    - Check network for Arxiv access
 
-2. **Image handling** - Extracted images are stored locally with captions. Reference them this way:
+2. **Image handling** - Extracted images are stored locally with captions. Always follow this format:
+   ```markdown
+   ![Descriptive alt text](../.paper2wechat/images/{paper_id}/page_XXX_YYY.png)
+   *图X: 详细的图注说明，解释图表的核心内容和意义*
    ```
-  ![Figure description](../.paper2wechat/images/{paper_id}/page_XXX_YYY.png)
-   ```
-  - Because the article is saved under outputs/, image links must be relative to outputs/.
-  - Use ../.paper2wechat/... (not .paper2wechat/...) so Markdown renders correctly.
+   **Important:**
+   - Use relative path `../.paper2wechat/...` (not `.paper2wechat/...`) since articles are in outputs/
+   - Always add caption line (斜体图注) below image to provide context
+   - Caption should explain what the figure shows and its significance
+   - Never insert images without context - add transition text before or after
+   - Example caption: *图1: FinSight系统架构展示了数据收集、数据分析和报告生成三个核心阶段的工作流*
 
 3. **Quality depends on:**
    - Deep understanding of paper (Part 3)

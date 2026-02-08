@@ -118,4 +118,4 @@ class TestPaperFetcher:
         assert x0 == 80
         assert x1 == 920
         assert top == 100
-        assert bottom == 394
+        assert bottom == 398
