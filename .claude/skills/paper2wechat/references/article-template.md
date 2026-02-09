@@ -28,14 +28,14 @@ Use this template when writing from parsed JSON, especially if LLM API keys are 
 
 [用通俗语言解释方法流程，避免堆术语]
 
-![图1说明](../images/[paper_id]/page_005_001.png)
+![图1说明](../images/[paper_id]/[image_file_from_parsed_json_1])
 _图1：说明图中结构/流程与正文结论的关系_
 
 ## 实验与结果
 
 [强调对比对象、指标变化、收益和代价]
 
-![图2说明](../images/[paper_id]/page_008_002.png)
+![图2说明](../images/[paper_id]/[image_file_from_parsed_json_2])
 _图2：说明该结果对业务或工程决策的意义_
 
 ## 落地建议
@@ -71,5 +71,7 @@ _图2：说明该结果对业务或工程决策的意义_
 - Add image captions with context; do not drop raw figures without explanation.
 - Keep practical summary concise and actionable.
 - Prefer extracting open-source links and related resources from parsed JSON text.
+- Build image links from `parsed/<paper_id>.json` -> `images[].url`; never guess filenames like `page_*.png`.
 - Use image paths that remain valid from `.paper2wechat/outputs/<paper_id>.md`.
+- Do not include tool-wrapper artifacts in final markdown: `</content>`, `<parameter name="filePath">...`, or local absolute paths like `/Users/...`.
 - Do not append tool credits or auto-generation disclaimers.

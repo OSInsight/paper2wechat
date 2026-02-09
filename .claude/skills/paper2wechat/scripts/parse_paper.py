@@ -7,17 +7,28 @@ original core fetcher, while remaining self-contained inside the skill package.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
+import html
 import json
+import logging
 import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import time
 import urllib.error
 import urllib.request
+import warnings
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from difflib import SequenceMatcher
 
 try:
     import requests
@@ -34,6 +45,72 @@ ARXIV_ID_PATTERN = re.compile(
     r"(?P<id>(\d{4}\.\d{4,5}|[a-z\-]+/\d{7})(v\d+)?)",
     re.IGNORECASE,
 )
+
+HEADER_CUTOFF_RATIO = 0.06
+HEADER_GUARD_RATIO = 0.03
+RELAXED_HEADER_EXTRA_RATIO = 0.04
+ALT_SIDE_MARGIN_RATIO = 0.02
+ALT_TOP_WINDOW_RATIO = 0.68
+WIDE_SIDE_MARGIN_RATIO = 0.015
+WIDE_TOP_WINDOW_RATIO = 0.80
+WIDE_FIGURE_MIN_WIDTH_RATIO = 0.74
+CLUSTER_X_GAP_RATIO = 0.28
+NEIGHBOR_X_EXPAND_RATIO = 0.42
+FRAGMENT_COVERAGE_THRESHOLD = 0.10
+# For broad overview/framework figures, prefer wider crops to avoid clipped edges.
+FORCE_WIDE_NARROW_RATIO = 0.86
+BROAD_TOP_FLOOR_RATIO = 0.008
+BROAD_SIDE_PAD_RATIO = 0.028
+BROAD_PAD_X_SCALE = 0.055
+BROAD_PAD_Y_SCALE = 0.045
+
+MAX_SOURCE_IMAGES = 12
+SOURCE_MIN_BYTES = 12 * 1024
+SOURCE_RASTER_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".gif",
+    ".tif",
+    ".tiff",
+)
+SOURCE_VECTOR_EXTENSIONS = (".pdf",)
+SOURCE_GRAPHIC_EXTENSIONS = SOURCE_RASTER_EXTENSIONS + SOURCE_VECTOR_EXTENSIONS + (".eps", ".ps", ".svg")
+
+HTTP_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+HTTP_MAX_ATTEMPTS = 4
+HTTP_BACKOFF_BASE_SECONDS = 1.4
+
+
+class _PDFMinerFontBBoxFilter(logging.Filter):
+    """Suppress noisy FontBBox warnings from malformed embedded font descriptors."""
+
+    NEEDLE = "Could not get FontBBox from font descriptor because"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return self.NEEDLE not in message
+
+
+def _configure_runtime_noise_filters() -> None:
+    """Keep parser stderr clean for known non-fatal third-party warnings."""
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Could not get FontBBox from font descriptor because .* cannot be parsed as 4 floats",
+    )
+
+    font_logger = logging.getLogger("pdfminer.pdffont")
+    if not any(isinstance(flt, _PDFMinerFontBBoxFilter) for flt in font_logger.filters):
+        font_logger.addFilter(_PDFMinerFontBBoxFilter())
+
+
+_configure_runtime_noise_filters()
 
 
 @dataclass
@@ -75,16 +152,24 @@ class PaperFetcher:
         self.timeout = timeout
         self.cache_root = Path(cache_dir)
         self.download_dir = self.cache_root / "downloads"
+        self.source_dir = self.cache_root / "sources"
         self.parsed_dir = self.cache_root / "parsed"
         self.images_dir = self.cache_root / "images"
+        self.last_image_backend = "unknown"
+        self.last_source_status = ""
+        self.last_source_figure_blocks = 0
 
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.source_dir.mkdir(parents=True, exist_ok=True)
         self.parsed_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
 
     def fetch_from_url(self, url: str) -> Paper:
         arxiv_id = self.parse_arxiv_url(url)
-        metadata = self._fetch_arxiv_metadata(arxiv_id)
+        try:
+            metadata = self._fetch_arxiv_metadata(arxiv_id)
+        except FetchError:
+            metadata = {}
 
         pdf_url = metadata.get("pdf_url") or f"https://arxiv.org/pdf/{arxiv_id}.pdf"
         pdf_path = self._download_pdf(pdf_url, arxiv_id)
@@ -167,23 +252,49 @@ class PaperFetcher:
         abstract = self._extract_abstract(full_text)
         cache_key = arxiv_id or pdf_file.stem
 
-        images = self._extract_figures_by_caption(
-            pdf_path=pdf_file,
-            cache_key=cache_key,
-        )
+        self.last_image_backend = "none"
+        images: List[ImageInfo] = []
+        if arxiv_id:
+            images = self._extract_images_from_arxiv_source(
+                arxiv_id=arxiv_id,
+                cache_key=cache_key,
+            )
+            if images:
+                if self.last_source_figure_blocks > len(images):
+                    images = self._supplement_source_images_with_pdf(
+                        source_images=images,
+                        pdf_path=pdf_file,
+                        cache_key=cache_key,
+                        required_count=self.last_source_figure_blocks,
+                    )
+                if self.last_image_backend != "tex-source+pdf-supplement":
+                    self.last_image_backend = "tex-source"
+        if not images:
+            images = self._extract_figures_by_caption(
+                pdf_path=pdf_file,
+                cache_key=cache_key,
+            )
+            if images:
+                self.last_image_backend = "pdf-caption"
         if not images:
             images = self._extract_figures_with_pdfplumber(
                 pdf_path=pdf_file,
                 cache_key=cache_key,
             )
+            if images:
+                self.last_image_backend = "pdf-plumber"
         if not images:
             images = self._extract_largest_figures_with_fitz(
                 pdf_path=pdf_file,
                 cache_key=cache_key,
                 max_images=8,
             )
+            if images:
+                self.last_image_backend = "pdf-fitz-largest"
         if not images:
             images = self._extract_pdf_images(reader, cache_key=cache_key)
+            if images:
+                self.last_image_backend = "pdf-embedded"
 
         paper = Paper(
             title=title,
@@ -216,18 +327,41 @@ class PaperFetcher:
         raise ValueError(f"Invalid Arxiv URL or ID: {url}")
 
     def _fetch_arxiv_metadata(self, arxiv_id: str) -> Dict[str, Any]:
-        api_url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
-        xml_text = self._http_get(api_url).decode("utf-8", errors="replace")
+        api_urls = [
+            f"https://export.arxiv.org/api/query?id_list={arxiv_id}",
+            f"https://arxiv.org/api/query?id_list={arxiv_id}",
+        ]
+        last_error: Optional[Exception] = None
 
+        for api_url in api_urls:
+            try:
+                xml_text = self._http_get(api_url).decode("utf-8", errors="replace")
+            except FetchError as exc:
+                last_error = exc
+                continue
+
+            metadata = self._parse_arxiv_metadata_xml(xml_text)
+            if metadata is not None:
+                return metadata
+
+        fallback = self._fetch_arxiv_metadata_from_abs_page(arxiv_id)
+        if fallback is not None:
+            return fallback
+
+        if last_error is not None:
+            raise FetchError(f"Failed to fetch arXiv metadata for {arxiv_id}") from last_error
+        raise FetchError(f"Arxiv paper not found: {arxiv_id}")
+
+    def _parse_arxiv_metadata_xml(self, xml_text: str) -> Optional[Dict[str, Any]]:
         try:
             root = ET.fromstring(xml_text)
-        except ET.ParseError as exc:
-            raise FetchError(f"Failed to parse Arxiv API response for {arxiv_id}") from exc
+        except ET.ParseError:
+            return None
 
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         entry = root.find("atom:entry", ns)
         if entry is None:
-            raise FetchError(f"Arxiv paper not found: {arxiv_id}")
+            return None
 
         title = self._clean_text(entry.findtext("atom:title", default="", namespaces=ns))
         abstract = self._clean_text(
@@ -240,12 +374,7 @@ class PaperFetcher:
         ]
 
         published_raw = entry.findtext("atom:published", default="", namespaces=ns)
-        published_date = None
-        if published_raw:
-            try:
-                published_date = datetime.fromisoformat(published_raw.replace("Z", "+00:00"))
-            except ValueError:
-                published_date = None
+        published_date = self._parse_published_date(published_raw)
 
         pdf_url = None
         for link in entry.findall("atom:link", ns):
@@ -268,6 +397,128 @@ class PaperFetcher:
             "pdf_url": pdf_url,
         }
 
+    def _fetch_arxiv_metadata_from_abs_page(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        abs_url = f"https://arxiv.org/abs/{arxiv_id}"
+        try:
+            html_text = self._http_get(abs_url).decode("utf-8", errors="replace")
+        except FetchError:
+            return None
+
+        title = (
+            self._extract_html_meta_content(html_text, "citation_title")
+            or self._extract_arxiv_title_from_html(html_text)
+        )
+
+        authors = self._extract_html_meta_multi(html_text, "citation_author")
+        abstract = (
+            self._extract_arxiv_abstract_from_html(html_text)
+            or self._extract_html_meta_content(html_text, "description")
+            or ""
+        )
+        if abstract.lower().startswith("abstract:"):
+            abstract = abstract.split(":", 1)[-1].strip()
+
+        date_raw = self._extract_html_meta_content(html_text, "citation_date")
+        published_date = self._parse_published_date(date_raw)
+
+        pdf_url = self._extract_html_meta_content(html_text, "citation_pdf_url")
+        if not pdf_url:
+            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+        if not any((title, abstract, authors, pdf_url)):
+            return None
+
+        return {
+            "title": title or "",
+            "abstract": abstract or "",
+            "authors": authors,
+            "published_date": published_date,
+            "pdf_url": pdf_url,
+        }
+
+    @staticmethod
+    def _extract_html_meta_content(html_text: str, name: str) -> str:
+        escaped = re.escape(name)
+        patterns = [
+            re.compile(
+                rf"<meta[^>]*\bname=[\"']{escaped}[\"'][^>]*\bcontent=[\"']([^\"']+)[\"'][^>]*>",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                rf"<meta[^>]*\bcontent=[\"']([^\"']+)[\"'][^>]*\bname=[\"']{escaped}[\"'][^>]*>",
+                flags=re.IGNORECASE,
+            ),
+        ]
+        for pattern in patterns:
+            match = pattern.search(html_text)
+            if match:
+                return html.unescape(match.group(1).strip())
+        return ""
+
+    def _extract_html_meta_multi(self, html_text: str, name: str) -> List[str]:
+        escaped = re.escape(name)
+        pattern = re.compile(
+            rf"<meta[^>]*\bname=[\"']{escaped}[\"'][^>]*\bcontent=[\"']([^\"']+)[\"'][^>]*>",
+            flags=re.IGNORECASE,
+        )
+        results: List[str] = []
+        for match in pattern.finditer(html_text):
+            value = html.unescape(match.group(1).strip())
+            clean = self._clean_text(value)
+            if clean:
+                results.append(clean)
+        return results
+
+    def _extract_arxiv_title_from_html(self, html_text: str) -> str:
+        match = re.search(
+            r"<h1[^>]*class=[\"'][^\"']*\btitle\b[^\"']*[\"'][^>]*>(.*?)</h1>",
+            html_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return ""
+        text = self._strip_html_tags(match.group(1))
+        text = re.sub(r"^\s*title\s*:\s*", "", text, flags=re.IGNORECASE)
+        return self._clean_text(text)
+
+    def _extract_arxiv_abstract_from_html(self, html_text: str) -> str:
+        match = re.search(
+            r"<blockquote[^>]*class=[\"'][^\"']*\babstract\b[^\"']*[\"'][^>]*>(.*?)</blockquote>",
+            html_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return ""
+        text = self._strip_html_tags(match.group(1))
+        text = re.sub(r"^\s*abstract\s*:\s*", "", text, flags=re.IGNORECASE)
+        return self._clean_text(text)
+
+    @staticmethod
+    def _strip_html_tags(value: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", value)
+        text = html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _parse_published_date(value: Optional[str]) -> Optional[datetime]:
+        raw = (value or "").strip()
+        if not raw:
+            return None
+        normalized = raw.replace("Z", "+00:00")
+        for candidate in (normalized, normalized.replace("/", "-")):
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                continue
+        date_match = re.search(r"(\d{4})[-/](\d{2})[-/](\d{2})", raw)
+        if date_match:
+            try:
+                year, month, day = map(int, date_match.groups())
+                return datetime(year, month, day, tzinfo=timezone.utc)
+            except ValueError:
+                return None
+        return None
+
     def _download_pdf(self, pdf_url: str, arxiv_id: str) -> Path:
         safe_id = arxiv_id.replace("/", "_")
         output_path = self.download_dir / f"{safe_id}.pdf"
@@ -277,6 +528,650 @@ class PaperFetcher:
         pdf_bytes = self._http_get(pdf_url)
         output_path.write_bytes(pdf_bytes)
         return output_path
+
+    def _download_arxiv_source(self, arxiv_id: str) -> Optional[Path]:
+        safe_id = arxiv_id.replace("/", "_")
+        output_path = self.download_dir / f"{safe_id}-source.bin"
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return output_path
+
+        source_urls = [
+            f"https://arxiv.org/src/{arxiv_id}",
+            f"https://export.arxiv.org/src/{arxiv_id}",
+        ]
+        for source_url in source_urls:
+            try:
+                source_bytes = self._http_get(source_url)
+            except FetchError:
+                continue
+            if not source_bytes or self._looks_like_html_payload(source_bytes):
+                continue
+            output_path.write_bytes(source_bytes)
+            return output_path
+
+        return None
+
+    def _extract_images_from_arxiv_source(self, arxiv_id: str, cache_key: str) -> List[ImageInfo]:
+        source_payload = self._download_arxiv_source(arxiv_id)
+        if source_payload is None:
+            self.last_source_status = "source payload unavailable"
+            return []
+
+        safe_key = cache_key.replace("/", "_")
+        extracted_source_dir = self.source_dir / safe_key
+        if extracted_source_dir.exists():
+            shutil.rmtree(extracted_source_dir)
+        extracted_source_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self._unpack_arxiv_source_archive(source_payload, extracted_source_dir):
+            self.last_source_status = "source archive unpack failed"
+            return []
+
+        figure_entries, figure_block_count = self._parse_tex_figure_entries(extracted_source_dir)
+        self.last_source_figure_blocks = figure_block_count
+        if not figure_entries:
+            if figure_block_count > 0:
+                self.last_source_status = "figure blocks found but no includegraphics assets"
+            else:
+                self.last_source_status = "no figure entries found in tex source"
+        by_name, by_stem = self._index_source_files(extracted_source_dir)
+        materialized: List[Tuple[Path, str]] = []
+        seen_source_paths = set()
+
+        with tempfile.TemporaryDirectory(prefix="p2w-source-images-") as temp_output:
+            temp_output_dir = Path(temp_output)
+
+            for entry in figure_entries:
+                if len(materialized) >= MAX_SOURCE_IMAGES:
+                    break
+                resolved = self._resolve_source_graphic_path(
+                    include_token=entry["include"],
+                    tex_dir=entry["tex_dir"],
+                    source_root=extracted_source_dir,
+                    by_name=by_name,
+                    by_stem=by_stem,
+                )
+                if resolved is None:
+                    continue
+                source_key = str(resolved.resolve())
+                if source_key in seen_source_paths:
+                    continue
+
+                output = self._materialize_source_image(
+                    source_path=resolved,
+                    output_dir=temp_output_dir,
+                    sequence=len(materialized) + 1,
+                )
+                if output is None:
+                    continue
+
+                caption = entry.get("caption") or f"Figure {len(materialized) + 1}"
+                materialized.append((output, caption))
+                seen_source_paths.add(source_key)
+
+            if not materialized:
+                for candidate in self._collect_fallback_source_images(extracted_source_dir):
+                    if len(materialized) >= MAX_SOURCE_IMAGES:
+                        break
+                    source_key = str(candidate.resolve())
+                    if source_key in seen_source_paths:
+                        continue
+
+                    output = self._materialize_source_image(
+                        source_path=candidate,
+                        output_dir=temp_output_dir,
+                        sequence=len(materialized) + 1,
+                    )
+                    if output is None:
+                        continue
+
+                    caption = f"Figure {len(materialized) + 1}"
+                    materialized.append((output, caption))
+                    seen_source_paths.add(source_key)
+
+            if not materialized:
+                self.last_source_status = "source figures found but materialization failed"
+                return []
+
+            paper_image_dir = self._prepare_image_dir(cache_key=cache_key, reset=True)
+            extracted: List[ImageInfo] = []
+            for index, (source_image, caption) in enumerate(materialized, start=1):
+                ext = source_image.suffix.lower()
+                if ext == ".jpeg":
+                    ext = ".jpg"
+                output_path = paper_image_dir / f"src_{index:03d}{ext}"
+                shutil.copy2(source_image, output_path)
+                relevance = round(max(0.72, 0.98 - (index - 1) * 0.018), 3)
+                extracted.append(
+                    ImageInfo(
+                        url=str(output_path.as_posix()),
+                        caption=caption,
+                        position=index,
+                        relevance_score=relevance,
+                    )
+                )
+
+        deduped = self._deduplicate_images(extracted)
+        if self.last_source_figure_blocks > len(deduped):
+            self.last_source_status = (
+                f"tex source images {len(deduped)}/{self.last_source_figure_blocks}; "
+                "remaining figures likely drawn in LaTeX (tikz/forest)"
+            )
+        else:
+            self.last_source_status = f"tex source images {len(deduped)}"
+        return deduped
+
+    def _unpack_arxiv_source_archive(self, payload_path: Path, output_dir: Path) -> bool:
+        if payload_path.stat().st_size <= 0:
+            return False
+
+        try:
+            with tarfile.open(str(payload_path), "r:*") as tar_obj:
+                self._safe_extract_tar(tar_obj, output_dir)
+            return True
+        except Exception:
+            pass
+
+        try:
+            with zipfile.ZipFile(str(payload_path), "r") as zip_obj:
+                self._safe_extract_zip(zip_obj, output_dir)
+            return True
+        except Exception:
+            pass
+
+        payload = payload_path.read_bytes()
+        if payload[:2] == b"\x1f\x8b":
+            try:
+                decompressed = gzip.decompress(payload)
+            except Exception:
+                decompressed = b""
+            if decompressed:
+                inner_path = output_dir / "_decompressed.bin"
+                inner_path.write_bytes(decompressed)
+                if self._unpack_arxiv_source_archive(inner_path, output_dir):
+                    inner_path.unlink(missing_ok=True)
+                    return True
+                inner_path.unlink(missing_ok=True)
+
+        if self._contains_latex_markers(payload):
+            (output_dir / "main.tex").write_bytes(payload)
+            return True
+
+        return any(output_dir.rglob("*.tex"))
+
+    @staticmethod
+    def _safe_extract_tar(tar_obj: tarfile.TarFile, destination: Path) -> None:
+        destination_resolved = destination.resolve()
+        for member in tar_obj.getmembers():
+            member_name = member.name.strip()
+            if not member_name:
+                continue
+            candidate = (destination / member_name).resolve()
+            if not PaperFetcher._is_within_directory(candidate, destination_resolved):
+                continue
+            try:
+                # Python 3.12+ recommends explicit extraction filter for safer defaults
+                # and to avoid future deprecation warnings.
+                tar_obj.extract(member, path=str(destination), filter="data")
+            except TypeError:
+                tar_obj.extract(member, path=str(destination))
+
+    @staticmethod
+    def _safe_extract_zip(zip_obj: zipfile.ZipFile, destination: Path) -> None:
+        destination_resolved = destination.resolve()
+        for name in zip_obj.namelist():
+            clean_name = name.strip()
+            if not clean_name:
+                continue
+            candidate = (destination / clean_name).resolve()
+            if not PaperFetcher._is_within_directory(candidate, destination_resolved):
+                continue
+            zip_obj.extract(clean_name, path=str(destination))
+
+    @staticmethod
+    def _is_within_directory(candidate: Path, root: Path) -> bool:
+        try:
+            candidate.resolve().relative_to(root.resolve())
+        except Exception:
+            return False
+        return True
+
+    def _parse_tex_figure_entries(self, source_root: Path) -> Tuple[List[Dict[str, Any]], int]:
+        entries: List[Dict[str, Any]] = []
+        figure_block_count = 0
+        tex_files = sorted(
+            source_root.rglob("*.tex"),
+            key=lambda path: (len(path.parts), path.as_posix()),
+        )
+        for tex_path in tex_files:
+            try:
+                content = tex_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            # Remove LaTeX comments while keeping escaped \%.
+            content = re.sub(r"(?<!\\)%[^\n]*", "", content)
+            blocks = self._extract_figure_blocks(content)
+            figure_block_count += len(blocks)
+            for block in blocks:
+                includes = self._extract_includegraphics_paths(block)
+                if not includes:
+                    continue
+                caption = self._extract_caption_from_figure_block(block)
+                for include in includes:
+                    entries.append(
+                        {
+                            "tex_dir": tex_path.parent,
+                            "include": include,
+                            "caption": caption,
+                        }
+                    )
+        return entries, figure_block_count
+
+    @staticmethod
+    def _extract_figure_blocks(tex_content: str) -> List[str]:
+        if not tex_content:
+            return []
+        pattern = re.compile(
+            r"\\begin\{figure\*?\}(.*?)\\end\{figure\*?\}",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return [match.group(1) for match in pattern.finditer(tex_content)]
+
+    @staticmethod
+    def _extract_includegraphics_paths(figure_block: str) -> List[str]:
+        paths: List[str] = []
+        patterns = [
+            re.compile(r"\\includegraphics(?:\s*\[[^\]]*\])?\s*\{([^{}]+)\}", re.IGNORECASE),
+            re.compile(r"\\includesvg(?:\s*\[[^\]]*\])?\s*\{([^{}]+)\}", re.IGNORECASE),
+        ]
+        for pattern in patterns:
+            for match in pattern.finditer(figure_block):
+                value = (match.group(1) or "").strip()
+                if value:
+                    paths.append(value)
+        return paths
+
+    def _extract_caption_from_figure_block(self, figure_block: str) -> str:
+        caption_head = re.search(
+            r"\\caption(?:\[[^\]]*\])?\s*\{",
+            figure_block,
+            flags=re.IGNORECASE,
+        )
+        if not caption_head:
+            return ""
+        open_brace_index = caption_head.end() - 1
+        raw_caption = self._extract_latex_braced_text(figure_block, open_brace_index)
+        return self._sanitize_latex_caption(raw_caption)
+
+    @staticmethod
+    def _extract_latex_braced_text(text: str, open_brace_index: int) -> str:
+        if open_brace_index < 0 or open_brace_index >= len(text) or text[open_brace_index] != "{":
+            return ""
+        depth = 0
+        chars: List[str] = []
+        for ch in text[open_brace_index:]:
+            if ch == "{":
+                depth += 1
+                if depth == 1:
+                    continue
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            if depth >= 1:
+                chars.append(ch)
+        return "".join(chars).strip()
+
+    def _sanitize_latex_caption(self, caption: str) -> str:
+        value = caption or ""
+        value = re.sub(r"\\label\{[^{}]*\}", "", value)
+        value = re.sub(r"\\(?:eq|auto)?ref\{[^{}]*\}", "", value)
+        value = re.sub(r"\\cite\w*\{[^{}]*\}", "", value)
+        for _ in range(3):
+            collapsed = re.sub(
+                r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?\{([^{}]*)\}",
+                r"\1",
+                value,
+            )
+            if collapsed == value:
+                break
+            value = collapsed
+        value = re.sub(r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?", "", value)
+        value = value.replace("{", "").replace("}", "")
+        return self._clean_text(value)[:260]
+
+    @staticmethod
+    def _index_source_files(source_root: Path) -> Tuple[Dict[str, List[Path]], Dict[str, List[Path]]]:
+        by_name: Dict[str, List[Path]] = {}
+        by_stem: Dict[str, List[Path]] = {}
+        for file_path in source_root.rglob("*"):
+            if not file_path.is_file():
+                continue
+            by_name.setdefault(file_path.name.lower(), []).append(file_path)
+            by_stem.setdefault(file_path.stem.lower(), []).append(file_path)
+        return by_name, by_stem
+
+    def _resolve_source_graphic_path(
+        self,
+        include_token: str,
+        tex_dir: Path,
+        source_root: Path,
+        by_name: Dict[str, List[Path]],
+        by_stem: Dict[str, List[Path]],
+    ) -> Optional[Path]:
+        token = (include_token or "").strip().strip("\"'").replace("\\", "/")
+        if not token:
+            return None
+        if token.startswith("http://") or token.startswith("https://"):
+            return None
+        if "$" in token or "{" in token or "}" in token:
+            return None
+        token = token.split("#", 1)[0].strip()
+        if not token:
+            return None
+
+        token_path = Path(token)
+        candidate_paths: List[Path] = []
+        if token_path.suffix:
+            candidate_paths.append(tex_dir / token_path)
+        else:
+            candidate_paths.append(tex_dir / token_path)
+            for extension in SOURCE_GRAPHIC_EXTENSIONS:
+                candidate_paths.append(tex_dir / f"{token}{extension}")
+
+        for candidate in candidate_paths:
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            if candidate.suffix.lower() not in SOURCE_GRAPHIC_EXTENSIONS:
+                continue
+            return candidate
+
+        best = self._best_source_file_matches(
+            token=token_path.name.lower(),
+            by_name=by_name,
+            by_stem=by_stem,
+        )
+        if best is None:
+            return None
+        try:
+            if not self._is_within_directory(best, source_root):
+                return None
+        except Exception:
+            return None
+        return best
+
+    def _best_source_file_matches(
+        self,
+        token: str,
+        by_name: Dict[str, List[Path]],
+        by_stem: Dict[str, List[Path]],
+    ) -> Optional[Path]:
+        options: List[Path] = []
+        if token in by_name:
+            options.extend(by_name[token])
+
+        token_stem = Path(token).stem.lower()
+        if token_stem in by_stem:
+            options.extend(by_stem[token_stem])
+
+        if not options:
+            return None
+
+        ranked = sorted(
+            {path.resolve() for path in options if path.suffix.lower() in SOURCE_GRAPHIC_EXTENSIONS},
+            key=self._source_file_rank,
+            reverse=True,
+        )
+        return ranked[0] if ranked else None
+
+    @staticmethod
+    def _source_file_rank(path: Path) -> float:
+        name = path.name.lower()
+        extension = path.suffix.lower()
+        try:
+            size = float(path.stat().st_size)
+        except Exception:
+            size = 0.0
+
+        score = min(size / (256 * 1024), 12.0)
+        if "fig" in name or "figure" in name:
+            score += 3.5
+        if "logo" in name or "icon" in name or "banner" in name:
+            score -= 3.0
+        if extension in SOURCE_RASTER_EXTENSIONS:
+            score += 2.0
+        if extension in SOURCE_VECTOR_EXTENSIONS:
+            score += 1.0
+        return score
+
+    def _materialize_source_image(
+        self,
+        source_path: Path,
+        output_dir: Path,
+        sequence: int,
+    ) -> Optional[Path]:
+        extension = source_path.suffix.lower()
+        if extension in SOURCE_RASTER_EXTENSIONS:
+            try:
+                if source_path.stat().st_size < SOURCE_MIN_BYTES:
+                    return None
+            except Exception:
+                return None
+            final_ext = ".jpg" if extension == ".jpeg" else extension
+            output_path = output_dir / f"source_{sequence:03d}{final_ext}"
+            try:
+                shutil.copy2(source_path, output_path)
+            except Exception:
+                return None
+            return output_path
+
+        if extension in SOURCE_VECTOR_EXTENSIONS:
+            output_path = output_dir / f"source_{sequence:03d}.png"
+            if self._rasterize_pdf_with_pdftoppm(source_path=source_path, output_path=output_path):
+                return output_path
+            if fitz is not None:
+                try:
+                    document = fitz.open(str(source_path))
+                    try:
+                        if document.page_count <= 0:
+                            return None
+                        first_page = document.load_page(0)
+                        pix = first_page.get_pixmap(matrix=fitz.Matrix(4.0, 4.0), alpha=False)
+                        if pix.width < 120 or pix.height < 80:
+                            return None
+                        pix.save(str(output_path))
+                    finally:
+                        document.close()
+                except Exception:
+                    return None
+                return output_path
+            if self._rasterize_pdf_with_sips(source_path=source_path, output_path=output_path):
+                return output_path
+
+        return None
+
+    @staticmethod
+    def _rasterize_pdf_with_pdftoppm(source_path: Path, output_path: Path) -> bool:
+        output_prefix = str(output_path.with_suffix(""))
+        try:
+            result = subprocess.run(
+                [
+                    "pdftoppm",
+                    "-png",
+                    "-singlefile",
+                    "-f",
+                    "1",
+                    "-l",
+                    "1",
+                    "-cropbox",
+                    "-r",
+                    "360",
+                    str(source_path),
+                    output_prefix,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            return False
+
+        if result.returncode != 0:
+            return False
+        if not output_path.exists():
+            return False
+        try:
+            return output_path.stat().st_size > 4096
+        except Exception:
+            return False
+
+    @staticmethod
+    def _rasterize_pdf_with_sips(source_path: Path, output_path: Path) -> bool:
+        try:
+            result = subprocess.run(
+                ["sips", "-s", "format", "png", str(source_path), "--out", str(output_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            return False
+
+        if result.returncode != 0:
+            return False
+        if not output_path.exists():
+            return False
+        try:
+            return output_path.stat().st_size > 1024
+        except Exception:
+            return False
+
+    def _collect_fallback_source_images(self, source_root: Path) -> List[Path]:
+        candidates: List[Path] = []
+        for file_path in source_root.rglob("*"):
+            if not file_path.is_file():
+                continue
+            extension = file_path.suffix.lower()
+            if extension not in SOURCE_RASTER_EXTENSIONS and extension not in SOURCE_VECTOR_EXTENSIONS:
+                continue
+            try:
+                if file_path.stat().st_size < SOURCE_MIN_BYTES:
+                    continue
+            except Exception:
+                continue
+            candidates.append(file_path)
+
+        ranked = sorted(candidates, key=self._source_file_rank, reverse=True)
+        return ranked[:MAX_SOURCE_IMAGES]
+
+    def _supplement_source_images_with_pdf(
+        self,
+        source_images: List[ImageInfo],
+        pdf_path: Path,
+        cache_key: str,
+        required_count: int,
+    ) -> List[ImageInfo]:
+        temp_key = f"{cache_key}__pdfsupp"
+        pdf_images = self._extract_figures_by_caption(
+            pdf_path=pdf_path,
+            cache_key=temp_key,
+        )
+        if not pdf_images:
+            return source_images
+
+        paper_image_dir = self._prepare_image_dir(cache_key=cache_key, reset=False)
+        existing_signatures = [self._caption_signature(image.caption) for image in source_images]
+        merged = list(source_images)
+        need = max(0, required_count - len(source_images))
+        added = 0
+
+        for image in pdf_images:
+            if need > 0 and added >= need:
+                break
+            if self._caption_is_duplicate(image.caption, existing_signatures):
+                continue
+
+            source_path = Path(image.url)
+            if not source_path.exists():
+                continue
+
+            ext = source_path.suffix.lower() or ".png"
+            if ext == ".jpeg":
+                ext = ".jpg"
+            output_path = paper_image_dir / f"pdfsupp_{added + 1:03d}{ext}"
+            try:
+                shutil.copy2(source_path, output_path)
+            except Exception:
+                continue
+
+            merged.append(
+                ImageInfo(
+                    url=str(output_path.as_posix()),
+                    caption=image.caption,
+                    position=len(merged) + 1,
+                    relevance_score=image.relevance_score,
+                )
+            )
+            existing_signatures.append(self._caption_signature(image.caption))
+            added += 1
+
+        self._cleanup_image_dir(temp_key)
+        if added > 0:
+            self.last_source_status = (
+                f"{self.last_source_status}; supplemented {added} figure(s) from PDF fallback"
+            )
+            self.last_image_backend = "tex-source+pdf-supplement"
+        return merged
+
+    def _cleanup_image_dir(self, cache_key: str) -> None:
+        safe_key = cache_key.replace("/", "_")
+        target_dir = self.images_dir / safe_key
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+
+    @staticmethod
+    def _caption_signature(caption: str) -> str:
+        text = (caption or "").lower()
+        text = re.sub(r"^\s*(figure|fig\.?)\s*\d+\s*[:.\-]?\s*", "", text, flags=re.IGNORECASE)
+        tokens = [tok for tok in re.findall(r"[a-z0-9]+", text) if len(tok) > 2]
+        return " ".join(tokens[:24])
+
+    @classmethod
+    def _caption_is_duplicate(cls, caption: str, signatures: List[str]) -> bool:
+        candidate = cls._caption_signature(caption)
+        if not candidate:
+            return False
+        for signature in signatures:
+            if not signature:
+                continue
+            if candidate == signature:
+                return True
+            if candidate in signature or signature in candidate:
+                if min(len(candidate), len(signature)) >= 26:
+                    return True
+            ratio = SequenceMatcher(None, candidate, signature).ratio()
+            if ratio >= 0.72:
+                return True
+        return False
+
+    @staticmethod
+    def _contains_latex_markers(payload: bytes) -> bool:
+        if not payload:
+            return False
+        head = payload[:8192]
+        return (
+            b"\\documentclass" in head
+            or b"\\begin{document}" in head
+            or b"\\begin{figure" in head
+        )
+
+    @staticmethod
+    def _looks_like_html_payload(payload: bytes) -> bool:
+        if not payload:
+            return False
+        sample = payload[:512].lower().lstrip()
+        return sample.startswith(b"<!doctype html") or sample.startswith(b"<html")
 
     def _save_parsed_cache(self, paper: Paper, cache_key: str) -> None:
         safe_key = cache_key.replace("/", "_")
@@ -321,19 +1216,72 @@ class PaperFetcher:
         headers = {"User-Agent": "paper2wechat-skill/1.0"}
 
         if requests is not None:
-            try:
-                response = requests.get(url, headers=headers, timeout=self.timeout)
-                response.raise_for_status()
-                return response.content
-            except Exception as exc:
-                raise FetchError(f"Request failed: {url}") from exc
+            last_error: Optional[Exception] = None
+            for attempt in range(1, HTTP_MAX_ATTEMPTS + 1):
+                try:
+                    response = requests.get(url, headers=headers, timeout=self.timeout)
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= HTTP_MAX_ATTEMPTS:
+                        break
+                    time.sleep(self._compute_retry_delay(attempt=attempt))
+                    continue
+
+                if response.status_code < 400:
+                    return response.content
+
+                if response.status_code in HTTP_RETRY_STATUS_CODES and attempt < HTTP_MAX_ATTEMPTS:
+                    time.sleep(
+                        self._compute_retry_delay(
+                            attempt=attempt,
+                            retry_after=response.headers.get("Retry-After", ""),
+                        )
+                    )
+                    continue
+
+                try:
+                    response.raise_for_status()
+                except Exception as exc:
+                    raise FetchError(f"Request failed: {url}") from exc
+
+            raise FetchError(f"Request failed: {url}") from last_error
 
         request = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.read()
-        except urllib.error.URLError as exc:  # pragma: no cover
-            raise FetchError(f"Request failed: {url}") from exc
+        last_error: Optional[Exception] = None
+        for attempt in range(1, HTTP_MAX_ATTEMPTS + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:  # pragma: no cover
+                last_error = exc
+                if exc.code in HTTP_RETRY_STATUS_CODES and attempt < HTTP_MAX_ATTEMPTS:
+                    retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+                    time.sleep(
+                        self._compute_retry_delay(
+                            attempt=attempt,
+                            retry_after=retry_after,
+                        )
+                    )
+                    continue
+                raise FetchError(f"Request failed: {url}") from exc
+            except urllib.error.URLError as exc:  # pragma: no cover
+                last_error = exc
+                if attempt >= HTTP_MAX_ATTEMPTS:
+                    break
+                time.sleep(self._compute_retry_delay(attempt=attempt))
+                continue
+
+        raise FetchError(f"Request failed: {url}") from last_error
+
+    @staticmethod
+    def _compute_retry_delay(attempt: int, retry_after: str = "") -> float:
+        retry_after = (retry_after or "").strip()
+        if retry_after.isdigit():
+            try:
+                return max(0.3, float(retry_after))
+            except ValueError:
+                pass
+        return HTTP_BACKOFF_BASE_SECONDS * attempt
 
     @staticmethod
     def _clean_text(text: str) -> str:
@@ -490,7 +1438,7 @@ class PaperFetcher:
             for page_index in range(document.page_count):
                 page = document.load_page(page_index)
                 page_rect = page.rect
-                header_cutoff = page_rect.y0 + page_rect.height * 0.10
+                header_cutoff = page_rect.y0 + page_rect.height * HEADER_CUTOFF_RATIO
                 rects = self._collect_fitz_image_rects(page)
                 for rect in rects:
                     if rect.y0 < header_cutoff:
@@ -512,7 +1460,7 @@ class PaperFetcher:
             for _, page_index, rect in selected:
                 page = document.load_page(page_index)
                 page_rect = page.rect
-                header_cutoff = page_rect.y0 + page_rect.height * 0.10
+                header_cutoff = page_rect.y0 + page_rect.height * HEADER_CUTOFF_RATIO
 
                 pad_x = max(page_rect.width * 0.01, rect.width * 0.02)
                 pad_y = max(page_rect.height * 0.01, rect.height * 0.03)
@@ -578,9 +1526,12 @@ class PaperFetcher:
                     continue
 
                 page_rect = page.rect
-                header_cutoff = page_rect.y0 + page_rect.height * 0.10
-                header_guard = page_rect.y0 + page_rect.height * 0.06
-                relaxed_header_cutoff = max(header_guard, header_cutoff - page_rect.height * 0.03)
+                header_cutoff = page_rect.y0 + page_rect.height * HEADER_CUTOFF_RATIO
+                header_guard = page_rect.y0 + page_rect.height * HEADER_GUARD_RATIO
+                relaxed_header_cutoff = max(
+                    header_guard,
+                    header_cutoff - page_rect.height * RELAXED_HEADER_EXTRA_RATIO,
+                )
                 image_rects = self._collect_fitz_image_rects(page)
                 for caption in captions:
                     cap_rect = caption["rect"]
@@ -593,13 +1544,37 @@ class PaperFetcher:
                     if clip is None:
                         continue
 
+                    clip = self._expand_fitz_clip_by_neighbors(
+                        clip=clip,
+                        page_rect=page_rect,
+                        image_rects=image_rects,
+                        caption_top=cap_rect.y0,
+                        top_guard=header_guard,
+                    )
+                    clip = self._promote_to_wide_caption_window(
+                        clip=clip,
+                        page_rect=page_rect,
+                        caption_top=cap_rect.y0,
+                        top_guard=header_guard,
+                        caption_text=caption["text"],
+                    )
+                    broad_figure = self._is_broad_figure_caption(caption["text"])
+                    width_ratio = clip.width / max(page_rect.width, 1e-6)
+                    if broad_figure and width_ratio < 0.95:
+                        clip = fitz.Rect(
+                            min(clip.x0, page_rect.x0 + page_rect.width * WIDE_SIDE_MARGIN_RATIO),
+                            clip.y0,
+                            max(clip.x1, page_rect.x1 - page_rect.width * WIDE_SIDE_MARGIN_RATIO),
+                            clip.y1,
+                        )
+
                     if clip.width < 120 or clip.height < 80:
-                        alt_top = max(header_cutoff, cap_rect.y0 - page_rect.height * 0.60)
+                        alt_top = max(header_guard, cap_rect.y0 - page_rect.height * WIDE_TOP_WINDOW_RATIO)
                         alt_bottom = cap_rect.y0 - 2
                         alt = fitz.Rect(
-                            page_rect.x0 + page_rect.width * 0.04,
+                            page_rect.x0 + page_rect.width * WIDE_SIDE_MARGIN_RATIO,
                             alt_top,
-                            page_rect.x1 - page_rect.width * 0.04,
+                            page_rect.x1 - page_rect.width * WIDE_SIDE_MARGIN_RATIO,
                             alt_bottom,
                         )
                         if alt.width < 120 or alt.height < 80:
@@ -607,11 +1582,17 @@ class PaperFetcher:
                         clip = alt
 
                     bottom_limit = cap_rect.y0 - max(2.0, page_rect.height * 0.003)
-                    pad_x = max(page_rect.width * 0.012, clip.width * 0.020)
-                    pad_y = max(page_rect.height * 0.012, clip.height * 0.030)
+                    if broad_figure:
+                        pad_x = max(page_rect.width * BROAD_SIDE_PAD_RATIO, clip.width * BROAD_PAD_X_SCALE)
+                        pad_y = max(page_rect.height * 0.018, clip.height * BROAD_PAD_Y_SCALE)
+                        top_floor = page_rect.y0 + page_rect.height * BROAD_TOP_FLOOR_RATIO
+                    else:
+                        pad_x = max(page_rect.width * 0.020, clip.width * 0.040)
+                        pad_y = max(page_rect.height * 0.016, clip.height * 0.040)
+                        top_floor = relaxed_header_cutoff
                     clip = fitz.Rect(
                         max(page_rect.x0, clip.x0 - pad_x),
-                        max(relaxed_header_cutoff, clip.y0 - pad_y),
+                        max(top_floor, clip.y0 - pad_y),
                         min(page_rect.x1, clip.x1 + pad_x),
                         min(bottom_limit, clip.y1 + pad_y),
                     )
@@ -620,12 +1601,12 @@ class PaperFetcher:
 
                     pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), clip=clip, alpha=False)
                     if pix.width * pix.height < 180000:
-                        alt_top = max(header_cutoff, cap_rect.y0 - page_rect.height * 0.60)
+                        alt_top = max(header_guard, cap_rect.y0 - page_rect.height * WIDE_TOP_WINDOW_RATIO)
                         alt_bottom = cap_rect.y0 - 2
                         alt = fitz.Rect(
-                            page_rect.x0 + page_rect.width * 0.04,
+                            page_rect.x0 + page_rect.width * WIDE_SIDE_MARGIN_RATIO,
                             alt_top,
-                            page_rect.x1 - page_rect.width * 0.04,
+                            page_rect.x1 - page_rect.width * WIDE_SIDE_MARGIN_RATIO,
                             alt_bottom,
                         )
                         if alt.width < 120 or alt.height < 80:
@@ -675,19 +1656,27 @@ class PaperFetcher:
         try:
             with pdfplumber.open(str(pdf_path)) as pdf:
                 for page_index, page in enumerate(pdf.pages):
-                    words = page.extract_words(
-                        x_tolerance=2,
-                        y_tolerance=2,
-                        keep_blank_chars=False,
-                    )
+                    try:
+                        words = page.extract_words(
+                            x_tolerance=2,
+                            y_tolerance=2,
+                            keep_blank_chars=False,
+                        )
+                    except Exception:
+                        # Skip pages with malformed font metadata instead of aborting
+                        # extraction for the entire paper.
+                        continue
                     captions = self._find_figure_captions_from_words(words)
                     if not captions:
                         continue
 
                     images = page.images or []
-                    header_cutoff = page.height * 0.10
-                    header_guard = page.height * 0.06
-                    relaxed_header_cutoff = max(header_guard, header_cutoff - page.height * 0.03)
+                    header_cutoff = page.height * HEADER_CUTOFF_RATIO
+                    header_guard = page.height * HEADER_GUARD_RATIO
+                    relaxed_header_cutoff = max(
+                        header_guard,
+                        header_cutoff - page.height * RELAXED_HEADER_EXTRA_RATIO,
+                    )
                     for caption in captions:
                         cap_top = float(caption["top"])
                         rect = self._select_plumber_figure_bbox(
@@ -696,17 +1685,31 @@ class PaperFetcher:
                             page_height=float(page.height),
                             header_cutoff=header_cutoff,
                             image_boxes=images,
+                            caption_text=caption["text"],
                         )
                         if rect is None:
                             continue
 
                         x0, top, x1, bottom = rect
-                        pad_x = max(float(page.width) * 0.015, (x1 - x0) * 0.02)
-                        pad_y = max(float(page.height) * 0.015, (bottom - top) * 0.03)
+                        broad_figure = self._is_broad_figure_caption(caption["text"])
+                        width_ratio = (x1 - x0) / max(float(page.width), 1e-6)
+                        if broad_figure and width_ratio < 0.95:
+                            x0 = min(x0, float(page.width) * WIDE_SIDE_MARGIN_RATIO)
+                            x1 = max(x1, float(page.width) * (1.0 - WIDE_SIDE_MARGIN_RATIO))
+
+                        if broad_figure:
+                            pad_x = max(float(page.width) * BROAD_SIDE_PAD_RATIO, (x1 - x0) * BROAD_PAD_X_SCALE)
+                            pad_y = max(float(page.height) * 0.018, (bottom - top) * BROAD_PAD_Y_SCALE)
+                            top_floor = float(page.height) * BROAD_TOP_FLOOR_RATIO
+                        else:
+                            pad_x = max(float(page.width) * 0.020, (x1 - x0) * 0.035)
+                            pad_y = max(float(page.height) * 0.016, (bottom - top) * 0.035)
+                            top_floor = relaxed_header_cutoff
+
                         bottom_limit = cap_top - max(2.0, float(page.height) * 0.003)
                         x0 = max(0.0, x0 - pad_x)
                         x1 = min(float(page.width), x1 + pad_x)
-                        top = max(relaxed_header_cutoff, top - pad_y)
+                        top = max(top_floor, top - pad_y)
                         bottom = min(bottom_limit, bottom + pad_y)
                         if bottom - top < 1:
                             continue
@@ -769,11 +1772,12 @@ class PaperFetcher:
             return None
 
         cap_top = caption_rect.y0
+        header_guard = page_rect.y0 + page_rect.height * HEADER_GUARD_RATIO
         candidates: List[Any] = []
         for rect in image_rects:
             if rect.y1 > cap_top + 4:
                 continue
-            if rect.y0 < header_cutoff:
+            if rect.y0 < header_guard:
                 continue
             if rect.width < page_rect.width * 0.16:
                 continue
@@ -794,14 +1798,14 @@ class PaperFetcher:
                     continue
                 if rect.y1 > cap_top + 4:
                     continue
-                if rect.y0 < header_cutoff:
+                if rect.y0 < header_guard:
                     continue
                 if rect.width < page_rect.width * 0.10:
                     continue
                 if rect.height < page_rect.height * 0.04:
                     continue
 
-                x_gap = page_rect.width * 0.10
+                x_gap = page_rect.width * CLUSTER_X_GAP_RATIO
                 if rect.x1 < best.x0 - x_gap or rect.x0 > best.x1 + x_gap:
                     continue
 
@@ -826,7 +1830,7 @@ class PaperFetcher:
             pad_y = page_rect.height * 0.01
             return fitz.Rect(
                 max(page_rect.x0, best.x0 - pad_x),
-                max(header_cutoff, best.y0 - pad_y),
+                max(header_guard, best.y0 - pad_y),
                 min(page_rect.x1, best.x1 + pad_x),
                 min(caption_rect.y0 - 2, best.y1 + pad_y),
             )
@@ -835,7 +1839,7 @@ class PaperFetcher:
         for rect in image_rects:
             if rect.y1 > cap_top + 4:
                 continue
-            if rect.y0 < header_cutoff:
+            if rect.y0 < header_guard:
                 continue
             if cap_top - rect.y1 > page_rect.height * 0.62:
                 continue
@@ -859,27 +1863,110 @@ class PaperFetcher:
                 union_area = max(union_w * union_h, 1.0)
                 covered_area = sum(rect.width * rect.height for rect in fragment_pool)
                 coverage = covered_area / union_area
-                if coverage >= 0.40:
+                if coverage >= FRAGMENT_COVERAGE_THRESHOLD:
                     pad_x = page_rect.width * 0.01
                     pad_y = page_rect.height * 0.01
                     return fitz.Rect(
                         max(page_rect.x0, union_x0 - pad_x),
-                        max(header_cutoff, union_y0 - pad_y),
+                        max(header_guard, union_y0 - pad_y),
                         min(page_rect.x1, union_x1 + pad_x),
                         min(caption_rect.y0 - 2, union_y1 + pad_y),
                     )
 
-        top = max(header_cutoff, cap_top - page_rect.height * 0.55)
+        top = max(header_guard, cap_top - page_rect.height * ALT_TOP_WINDOW_RATIO)
         bottom = cap_top - 2
         if bottom - top < 90:
             return None
 
         return fitz.Rect(
-            page_rect.x0 + page_rect.width * 0.04,
+            page_rect.x0 + page_rect.width * ALT_SIDE_MARGIN_RATIO,
             top,
-            page_rect.x1 - page_rect.width * 0.04,
+            page_rect.x1 - page_rect.width * ALT_SIDE_MARGIN_RATIO,
             bottom,
         )
+
+    @staticmethod
+    def _expand_fitz_clip_by_neighbors(
+        clip: Any,
+        page_rect: Any,
+        image_rects: List[Any],
+        caption_top: float,
+        top_guard: float,
+    ) -> Any:
+        if fitz is None:
+            return clip
+
+        neighbors: List[Any] = []
+        for rect in image_rects:
+            if rect.y1 > caption_top + 6:
+                continue
+            if rect.y0 < top_guard:
+                continue
+            if rect.width < page_rect.width * 0.03:
+                continue
+            if rect.height < page_rect.height * 0.02:
+                continue
+            if rect.x1 < clip.x0 - page_rect.width * NEIGHBOR_X_EXPAND_RATIO:
+                continue
+            if rect.x0 > clip.x1 + page_rect.width * NEIGHBOR_X_EXPAND_RATIO:
+                continue
+
+            vertical_overlap = min(rect.y1, clip.y1) - max(rect.y0, clip.y0)
+            align_close = (
+                vertical_overlap >= min(rect.height, clip.height) * 0.08
+                or abs(rect.y0 - clip.y0) <= page_rect.height * 0.04
+                or abs(rect.y1 - clip.y1) <= page_rect.height * 0.04
+            )
+            if not align_close:
+                continue
+            neighbors.append(rect)
+
+        if not neighbors:
+            return clip
+
+        union_x0 = min([clip.x0] + [r.x0 for r in neighbors])
+        union_y0 = min([clip.y0] + [r.y0 for r in neighbors])
+        union_x1 = max([clip.x1] + [r.x1 for r in neighbors])
+        union_y1 = max([clip.y1] + [r.y1 for r in neighbors])
+
+        pad_x = page_rect.width * 0.012
+        pad_y = page_rect.height * 0.012
+        return fitz.Rect(
+            max(page_rect.x0, union_x0 - pad_x),
+            max(top_guard, union_y0 - pad_y),
+            min(page_rect.x1, union_x1 + pad_x),
+            min(caption_top - 2, union_y1 + pad_y),
+        )
+
+    @staticmethod
+    def _promote_to_wide_caption_window(
+        clip: Any,
+        page_rect: Any,
+        caption_top: float,
+        top_guard: float,
+        caption_text: str,
+    ) -> Any:
+        if fitz is None:
+            return clip
+
+        width_ratio = clip.width / max(page_rect.width, 1e-6)
+        broad_hint = PaperFetcher._is_broad_figure_caption(caption_text)
+        if width_ratio >= WIDE_FIGURE_MIN_WIDTH_RATIO and not broad_hint:
+            return clip
+
+        wide = fitz.Rect(
+            page_rect.x0 + page_rect.width * WIDE_SIDE_MARGIN_RATIO,
+            max(top_guard, caption_top - page_rect.height * WIDE_TOP_WINDOW_RATIO),
+            page_rect.x1 - page_rect.width * WIDE_SIDE_MARGIN_RATIO,
+            min(page_rect.y1, caption_top - 2),
+        )
+        if wide.width < 120 or wide.height < 80:
+            return clip
+        if broad_hint and width_ratio <= FORCE_WIDE_NARROW_RATIO:
+            return wide
+        if wide.get_area() > clip.get_area() * 1.15:
+            return wide
+        return clip
 
     @staticmethod
     def _find_figure_captions(page: Any) -> List[Dict[str, Any]]:
@@ -961,7 +2048,9 @@ class PaperFetcher:
         page_height: float,
         header_cutoff: float,
         image_boxes: List[Dict[str, Any]],
+        caption_text: str = "",
     ) -> Optional[Tuple[float, float, float, float]]:
+        header_guard = page_height * HEADER_GUARD_RATIO
         candidates: List[Tuple[float, float, Tuple[float, float, float, float]]] = []
         for image in image_boxes:
             x0 = float(image.get("x0", 0))
@@ -971,7 +2060,7 @@ class PaperFetcher:
 
             if bottom > caption_top + 4:
                 continue
-            if top < header_cutoff:
+            if top < header_guard:
                 continue
             if x1 - x0 < page_width * 0.16:
                 continue
@@ -984,12 +2073,71 @@ class PaperFetcher:
 
         if candidates:
             _, _, rect = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
+            best_x0, best_top, best_x1, best_bottom = rect
+            best_w = best_x1 - best_x0
+            best_h = best_bottom - best_top
+
+            cluster: List[Tuple[float, float, float, float]] = [rect]
+            x_gap = page_width * CLUSTER_X_GAP_RATIO
+            for image in image_boxes:
+                x0 = float(image.get("x0", 0))
+                x1 = float(image.get("x1", 0))
+                top = float(image.get("top", 0))
+                bottom = float(image.get("bottom", 0))
+                if (x0, top, x1, bottom) == rect:
+                    continue
+                if bottom > caption_top + 4:
+                    continue
+                if top < header_guard:
+                    continue
+                if x1 - x0 < page_width * 0.03:
+                    continue
+                if bottom - top < page_height * 0.02:
+                    continue
+                if x1 < best_x0 - x_gap or x0 > best_x1 + x_gap:
+                    continue
+
+                overlap = min(bottom, best_bottom) - max(top, best_top)
+                aligned = (
+                    overlap >= min(bottom - top, best_h) * 0.05
+                    or abs(top - best_top) <= page_height * 0.12
+                    or abs(bottom - best_bottom) <= page_height * 0.12
+                )
+                if not aligned:
+                    continue
+                cluster.append((x0, top, x1, bottom))
+
+            if len(cluster) >= 2:
+                union_x0 = min(r[0] for r in cluster)
+                union_top = min(r[1] for r in cluster)
+                union_x1 = max(r[2] for r in cluster)
+                union_bottom = max(r[3] for r in cluster)
+                union_w = union_x1 - union_x0
+                union_h = union_bottom - union_top
+                union_area = max(union_w * union_h, 1.0)
+                covered_area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in cluster)
+                coverage = covered_area / union_area
+                if (
+                    union_w >= page_width * 0.36
+                    and union_h >= page_height * 0.12
+                    and coverage >= FRAGMENT_COVERAGE_THRESHOLD
+                ):
+                    rect = (union_x0, union_top, union_x1, union_bottom)
+
+            rect = PaperFetcher._promote_to_wide_window_tuple(
+                rect=rect,
+                page_width=page_width,
+                page_height=page_height,
+                caption_top=caption_top,
+                caption_text=caption_text,
+            )
+
             x0, top, x1, bottom = rect
-            pad_x = page_width * 0.01
-            pad_y = page_height * 0.01
+            pad_x = page_width * 0.012
+            pad_y = page_height * 0.012
             return (
                 max(0.0, x0 - pad_x),
-                max(header_cutoff, top - pad_y),
+                max(header_guard, top - pad_y),
                 min(page_width, x1 + pad_x),
                 min(caption_top - 2, bottom + pad_y),
             )
@@ -1002,7 +2150,7 @@ class PaperFetcher:
             bottom = float(image.get("bottom", 0))
             if bottom > caption_top + 4:
                 continue
-            if top < header_cutoff:
+            if top < header_guard:
                 continue
             if caption_top - bottom > page_height * 0.62:
                 continue
@@ -1027,21 +2175,82 @@ class PaperFetcher:
                 pad_y = page_height * 0.01
                 return (
                     max(0.0, union_x0 - pad_x),
-                    max(header_cutoff, union_top - pad_y),
+                    max(header_guard, union_top - pad_y),
                     min(page_width, union_x1 + pad_x),
                     min(caption_top - 2, union_bottom + pad_y),
                 )
 
-        top = max(header_cutoff, caption_top - page_height * 0.32)
+        top = max(header_guard, caption_top - page_height * WIDE_TOP_WINDOW_RATIO)
         bottom = caption_top - 2
         if bottom - top < 90:
             return None
         return (
-            page_width * 0.08,
+            page_width * WIDE_SIDE_MARGIN_RATIO,
             top,
-            page_width * 0.92,
+            page_width * (1.0 - WIDE_SIDE_MARGIN_RATIO),
             bottom,
         )
+
+    @staticmethod
+    def _promote_to_wide_window_tuple(
+        rect: Tuple[float, float, float, float],
+        page_width: float,
+        page_height: float,
+        caption_top: float,
+        caption_text: str,
+    ) -> Tuple[float, float, float, float]:
+        x0, top, x1, bottom = rect
+        width_ratio = (x1 - x0) / max(page_width, 1e-6)
+        broad_hint = PaperFetcher._is_broad_figure_caption(caption_text)
+        if width_ratio >= WIDE_FIGURE_MIN_WIDTH_RATIO and not broad_hint:
+            return rect
+
+        wide_top = max(page_height * HEADER_GUARD_RATIO, caption_top - page_height * WIDE_TOP_WINDOW_RATIO)
+        wide_bottom = caption_top - 2
+        wide = (
+            page_width * WIDE_SIDE_MARGIN_RATIO,
+            wide_top,
+            page_width * (1.0 - WIDE_SIDE_MARGIN_RATIO),
+            wide_bottom,
+        )
+        wide_area = max((wide[2] - wide[0]) * (wide[3] - wide[1]), 1.0)
+        cur_area = max((x1 - x0) * (bottom - top), 1.0)
+        if broad_hint and width_ratio <= FORCE_WIDE_NARROW_RATIO:
+            return wide
+        if wide[2] - wide[0] >= 120 and wide[3] - wide[1] >= 80 and wide_area > cur_area * 1.15:
+            return wide
+        return rect
+
+    @staticmethod
+    def _is_broad_figure_caption(caption_text: str) -> bool:
+        text = (caption_text or "").lower()
+        broad_tokens = (
+            "(a)",
+            "(b)",
+            "(c)",
+            "overview",
+            "framework",
+            "taxonomy",
+            "task suite",
+            "pipeline",
+            "architecture",
+            "system diagram",
+            "left:",
+            "right:",
+        )
+        if any(token in text for token in broad_tokens):
+            return True
+
+        match = re.search(r"(?:figure|fig\.?)\s*(\d+)", text, re.IGNORECASE)
+        if match:
+            try:
+                number = int(match.group(1))
+            except ValueError:
+                number = 0
+            # Early figures are often global overview charts; prefer safer wide fallback.
+            if 0 < number <= 2:
+                return True
+        return False
 
     def _prepare_image_dir(self, cache_key: str, reset: bool = False) -> Path:
         safe_key = cache_key.replace("/", "_")
@@ -1237,6 +2446,9 @@ def main() -> None:
         print(f"Title: {paper.title}")
         print(f"Sections: {len(paper.sections)}")
         print(f"Images extracted: {len(paper.images)}")
+        print(f"Image backend: {fetcher.last_image_backend}")
+        if fetcher.last_source_status:
+            print(f"TeX source status: {fetcher.last_source_status}")
 
     print(f"Parsed cache: {parsed_path.as_posix()}")
     print(f"Images dir: {images_dir.as_posix()}")

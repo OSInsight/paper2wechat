@@ -1,6 +1,6 @@
 ---
 name: paper2wechat
-description: Convert Arxiv papers (URL, Arxiv ID, or local PDF) into WeChat Official Account markdown articles with practical summaries, PDF figure extraction, and auto-recommended writing style based on parsed paper content (academic-science, academic-tech, academic-trend, academic-applied). Use when users ask to解读论文、转公众号文章、提炼可落地要点、自动配图或按受众调整语气和篇幅.
+description: Convert Arxiv papers (URL, Arxiv ID, or local PDF) into WeChat Official Account markdown articles with practical summaries, TeX-source-first figure extraction (PDF fallback), and auto-recommended writing style based on parsed paper content (academic-science, academic-tech, academic-trend, academic-applied). Use when users ask to解读论文、转公众号文章、提炼可落地要点、自动配图或按受众调整语气和篇幅.
 ---
 
 # Paper2WeChat
@@ -31,6 +31,10 @@ bash .claude/skills/paper2wechat/scripts/fetch_paper.sh "<url_or_id_or_pdf>" ".p
 Expect output lines like:
 - `Parsed cache: .paper2wechat/parsed/<paper_id>.json`
 - `Images dir: .paper2wechat/images/<paper_id>`
+
+Image extraction behavior:
+- For arXiv URL/ID: prefer TeX source images first, then fallback to PDF caption-based extraction.
+- For local PDF: use PDF extraction path directly.
 
 Verify parser output before writing:
 - `title`, `authors`, `abstract`
@@ -80,6 +84,8 @@ Extract useful links directly during writing from parsed JSON text:
 For image links:
 - default output file is under `.paper2wechat/outputs/`
 - use relative image paths like `../images/<paper_id>/<image_file>`
+- image filename must come from `.paper2wechat/parsed/<paper_id>.json` (`images[].url`) instead of guessed naming patterns
+- never guess filenames like `page_*.png` when parsed JSON provides `src_*.png`.
 
 Always include:
 - concise 导读
@@ -90,6 +96,10 @@ Always include:
 - `关键词` hashtag line
 
 Never add tool-credit disclaimers like “本文由...自动生成”.
+Never output tool-wrapper artifacts in markdown body, including:
+- `</content>`
+- `<parameter name="filePath">...`
+- local absolute paths like `/Users/...`
 
 ## Step 5: Validate Output Quality
 
@@ -99,6 +109,8 @@ Check the final markdown file:
 - 2-5 images are inserted with contextual text and captions when available.
 - Claims and numbers align with source content.
 - Output path exists (default: `.paper2wechat/outputs/<paper_id>.md`).
+- MUST verify every image link resolves from output file directory.
+- MUST verify markdown does not contain tool-wrapper artifacts (`</content>`, `<parameter name="filePath">`, absolute local paths).
 
 ## Resources
 
