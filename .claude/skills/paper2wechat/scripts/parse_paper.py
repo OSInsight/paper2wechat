@@ -132,6 +132,7 @@ class Section:
 class Paper:
     title: str
     authors: List[str] = field(default_factory=list)
+    affiliations: List[str] = field(default_factory=list)
     abstract: str = ""
     published_date: Optional[datetime] = None
     arxiv_id: Optional[str] = None
@@ -151,21 +152,40 @@ class PaperFetcher:
     def __init__(self, cache_dir: str = ".paper2wechat", timeout: int = 30):
         self.timeout = timeout
         self.cache_root = Path(cache_dir)
-        self.download_dir = self.cache_root / "downloads"
-        self.source_dir = self.cache_root / "sources"
-        self.parsed_dir = self.cache_root / "parsed"
-        self.images_dir = self.cache_root / "images"
+        self.paper_key = ""
+        self.paper_dir = self.cache_root
+        self.download_dir = self.paper_dir / "downloads"
+        self.source_dir = self.paper_dir / "sources"
+        self.parsed_dir = self.paper_dir / "parsed"
+        self.images_dir = self.paper_dir / "images"
         self.last_image_backend = "unknown"
         self.last_source_status = ""
         self.last_source_figure_blocks = 0
+
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _safe_key(value: str) -> str:
+        return (value or "paper").replace("/", "_")
+
+    def _activate_paper_workspace(self, cache_key: str) -> str:
+        safe_key = self._safe_key(cache_key)
+        self.paper_key = safe_key
+        self.paper_dir = self.cache_root / safe_key
+        self.download_dir = self.paper_dir / "downloads"
+        self.source_dir = self.paper_dir / "sources"
+        self.parsed_dir = self.paper_dir / "parsed"
+        self.images_dir = self.paper_dir / "images"
 
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.source_dir.mkdir(parents=True, exist_ok=True)
         self.parsed_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
+        return safe_key
 
     def fetch_from_url(self, url: str) -> Paper:
         arxiv_id = self.parse_arxiv_url(url)
+        self._activate_paper_workspace(arxiv_id)
         try:
             metadata = self._fetch_arxiv_metadata(arxiv_id)
         except FetchError:
@@ -183,6 +203,7 @@ class PaperFetcher:
         paper.title = metadata.get("title") or paper.title
         paper.abstract = metadata.get("abstract") or paper.abstract
         paper.authors = metadata.get("authors") or paper.authors
+        paper.affiliations = metadata.get("affiliations") or paper.affiliations
         paper.published_date = metadata.get("published_date") or paper.published_date
         paper.pdf_url = pdf_url
         paper.url = f"https://arxiv.org/abs/{arxiv_id}"
@@ -199,6 +220,8 @@ class PaperFetcher:
         pdf_file = Path(pdf_path).expanduser().resolve()
         if not pdf_file.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_file}")
+        cache_key = arxiv_id or pdf_file.stem
+        self._activate_paper_workspace(cache_key)
 
         try:
             from pypdf import PdfReader
@@ -248,10 +271,9 @@ class PaperFetcher:
         if not full_text:
             raise FetchError(f"No extractable text found in PDF: {pdf_file}")
 
+        affiliations = self._extract_affiliations_from_text(full_text)
         sections = self._split_sections(full_text)
         abstract = self._extract_abstract(full_text)
-        cache_key = arxiv_id or pdf_file.stem
-
         self.last_image_backend = "none"
         images: List[ImageInfo] = []
         if arxiv_id:
@@ -299,6 +321,7 @@ class PaperFetcher:
         paper = Paper(
             title=title,
             authors=authors,
+            affiliations=affiliations,
             abstract=abstract,
             arxiv_id=arxiv_id,
             pdf_url=str(pdf_file),
@@ -358,7 +381,10 @@ class PaperFetcher:
         except ET.ParseError:
             return None
 
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        ns = {
+            "atom": "http://www.w3.org/2005/Atom",
+            "arxiv": "http://arxiv.org/schemas/atom",
+        }
         entry = root.find("atom:entry", ns)
         if entry is None:
             return None
@@ -367,11 +393,20 @@ class PaperFetcher:
         abstract = self._clean_text(
             entry.findtext("atom:summary", default="", namespaces=ns)
         )
-        authors = [
-            self._clean_text(author.findtext("atom:name", default="", namespaces=ns))
-            for author in entry.findall("atom:author", ns)
-            if self._clean_text(author.findtext("atom:name", default="", namespaces=ns))
-        ]
+        authors: List[str] = []
+        affiliations: List[str] = []
+        for author in entry.findall("atom:author", ns):
+            author_name = self._clean_text(
+                author.findtext("atom:name", default="", namespaces=ns)
+            )
+            if author_name:
+                authors.append(author_name)
+
+            affiliation = self._clean_text(
+                author.findtext("arxiv:affiliation", default="", namespaces=ns)
+            )
+            if affiliation:
+                affiliations.append(affiliation)
 
         published_raw = entry.findtext("atom:published", default="", namespaces=ns)
         published_date = self._parse_published_date(published_raw)
@@ -393,6 +428,7 @@ class PaperFetcher:
             "title": title,
             "abstract": abstract,
             "authors": authors,
+            "affiliations": self._dedupe_preserve_order(affiliations),
             "published_date": published_date,
             "pdf_url": pdf_url,
         }
@@ -410,6 +446,8 @@ class PaperFetcher:
         )
 
         authors = self._extract_html_meta_multi(html_text, "citation_author")
+        affiliations = self._extract_html_meta_multi(html_text, "citation_author_institution")
+        affiliations.extend(self._extract_html_meta_multi(html_text, "citation_author_affiliation"))
         abstract = (
             self._extract_arxiv_abstract_from_html(html_text)
             or self._extract_html_meta_content(html_text, "description")
@@ -425,13 +463,14 @@ class PaperFetcher:
         if not pdf_url:
             pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
-        if not any((title, abstract, authors, pdf_url)):
+        if not any((title, abstract, authors, affiliations, pdf_url)):
             return None
 
         return {
             "title": title or "",
             "abstract": abstract or "",
             "authors": authors,
+            "affiliations": self._dedupe_preserve_order(affiliations),
             "published_date": published_date,
             "pdf_url": pdf_url,
         }
@@ -557,8 +596,7 @@ class PaperFetcher:
             self.last_source_status = "source payload unavailable"
             return []
 
-        safe_key = cache_key.replace("/", "_")
-        extracted_source_dir = self.source_dir / safe_key
+        extracted_source_dir = self.source_dir
         if extracted_source_dir.exists():
             shutil.rmtree(extracted_source_dir)
         extracted_source_dir.mkdir(parents=True, exist_ok=True)
@@ -1125,8 +1163,11 @@ class PaperFetcher:
         return merged
 
     def _cleanup_image_dir(self, cache_key: str) -> None:
-        safe_key = cache_key.replace("/", "_")
-        target_dir = self.images_dir / safe_key
+        safe_key = self._safe_key(cache_key)
+        if safe_key == self.paper_key:
+            target_dir = self.images_dir
+        else:
+            target_dir = self.images_dir / f"_{safe_key}"
         if target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
 
@@ -1174,12 +1215,13 @@ class PaperFetcher:
         return sample.startswith(b"<!doctype html") or sample.startswith(b"<html")
 
     def _save_parsed_cache(self, paper: Paper, cache_key: str) -> None:
-        safe_key = cache_key.replace("/", "_")
+        safe_key = self._safe_key(cache_key)
         cache_path = self.parsed_dir / f"{safe_key}.json"
 
         payload = {
             "title": paper.title,
             "authors": paper.authors,
+            "affiliations": paper.affiliations,
             "abstract": paper.abstract,
             "published_date": paper.published_date.isoformat()
             if paper.published_date
@@ -1293,6 +1335,156 @@ class PaperFetcher:
             return []
         parts = re.split(r",| and ", author_field)
         return [part.strip() for part in parts if part.strip()]
+
+    def _extract_affiliations_from_text(self, text: str, max_items: int = 6) -> List[str]:
+        if not text:
+            return []
+
+        normalized = text.replace("\r", "\n")
+        lines = [self._clean_text(line) for line in normalized.splitlines() if line.strip()]
+        if not lines:
+            return []
+
+        front_lines: List[str] = []
+        for line in lines:
+            lower = line.lower()
+            if re.fullmatch(r"abstract[:\s]*", lower):
+                break
+            if self._looks_like_section_heading(line):
+                break
+            front_lines.append(line)
+            if len(front_lines) >= 80:
+                break
+
+        if not front_lines:
+            front_lines = lines[:80]
+
+        keyword_pattern = re.compile(
+            r"\b("
+            r"university|institute|college|school|department|faculty|laboratory|lab|"
+            r"research\s+center|research\s+lab|research\s+institute|center|centre|"
+            r"academy|hospital|corp(?:oration)?|inc\.?|ltd\.?|llc|company|team"
+            r")\b|大学|学院|研究所|实验室|研究院|中心|公司|团队",
+            flags=re.IGNORECASE,
+        )
+        stop_pattern = re.compile(
+            r"\b(figure|table|abstract|introduction|keywords?|references?)\b",
+            flags=re.IGNORECASE,
+        )
+        email_pattern = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+
+        candidates: List[str] = []
+        for line in front_lines:
+            if len(line) < 4 or len(line) > 180:
+                continue
+            if stop_pattern.search(line):
+                continue
+            if not keyword_pattern.search(line):
+                continue
+            if sum(ch.isdigit() for ch in line) > max(6, int(len(line) * 0.2)):
+                continue
+            for chunk in self._split_affiliation_candidates(line):
+                cleaned = self._normalize_affiliation_text(chunk)
+                if cleaned and keyword_pattern.search(cleaned):
+                    candidates.append(cleaned)
+
+        front_blob = "\n".join(front_lines)
+        for domain in email_pattern.findall(front_blob):
+            label = self._domain_to_org_label(domain)
+            if label:
+                candidates.append(label)
+
+        return self._dedupe_preserve_order(candidates)[:max_items]
+
+    @staticmethod
+    def _normalize_affiliation_text(text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        cleaned = re.sub(
+            r"^[\W\d_]*\s*also affiliated with\s*[:：-]?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^\(?\d+\)?\s*[:：-]?\s*", "", cleaned)
+        cleaned = re.sub(r"^[\W\d_]+", "", cleaned)
+        cleaned = re.sub(r"[;,.，。:：\s]+$", "", cleaned)
+        cleaned = re.sub(r"\s*\([^)]*@[^)]*\)", "", cleaned)
+        if len(cleaned) < 4:
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _split_affiliation_candidates(text: str) -> List[str]:
+        value = (text or "").strip()
+        if not value:
+            return []
+        normalized = re.sub(
+            r"(?<=[A-Za-z\u4e00-\u9fff])\d{1,2}(?=[A-Z\u4e00-\u9fff])",
+            "; ",
+            value,
+        )
+        normalized = re.sub(r"(?:(?<=\s)|^)\d{1,2}(?=[A-Za-z\u4e00-\u9fff])", "", normalized)
+        parts = [segment.strip() for segment in re.split(r"[;；|]+", normalized) if segment.strip()]
+        return parts or [value]
+
+    @staticmethod
+    def _domain_to_org_label(domain: str) -> Optional[str]:
+        value = (domain or "").strip().lower().strip(".")
+        if not value:
+            return None
+
+        public_domains = {
+            "gmail.com",
+            "outlook.com",
+            "hotmail.com",
+            "qq.com",
+            "163.com",
+            "126.com",
+            "yahoo.com",
+            "proton.me",
+            "icloud.com",
+        }
+        if value in public_domains:
+            return None
+
+        parts = [segment for segment in value.split(".") if segment]
+        if len(parts) < 2:
+            return None
+
+        token = parts[-2]
+        if not token or token in {
+            "mail",
+            "email",
+            "cs",
+            "ece",
+            "dept",
+            "ac",
+            "edu",
+            "org",
+            "net",
+            "com",
+            "cn",
+        }:
+            return None
+        if len(token) <= 2:
+            return None
+
+        token = token.replace("-", " ")
+        if len(token) <= 4:
+            return token.upper()
+        return token.title()
+
+    @staticmethod
+    def _dedupe_preserve_order(values: List[str]) -> List[str]:
+        seen = set()
+        deduped: List[str] = []
+        for value in values:
+            key = value.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(value.strip())
+        return deduped
 
     def _extract_abstract(self, text: str) -> str:
         lines = [line.strip() for line in text.splitlines()]
@@ -2253,8 +2445,11 @@ class PaperFetcher:
         return False
 
     def _prepare_image_dir(self, cache_key: str, reset: bool = False) -> Path:
-        safe_key = cache_key.replace("/", "_")
-        paper_image_dir = self.images_dir / safe_key
+        safe_key = self._safe_key(cache_key)
+        if safe_key == self.paper_key:
+            paper_image_dir = self.images_dir
+        else:
+            paper_image_dir = self.images_dir / f"_{safe_key}"
         paper_image_dir.mkdir(parents=True, exist_ok=True)
 
         if reset:
@@ -2437,8 +2632,9 @@ def main() -> None:
         paper = fetcher.fetch_from_pdf(str(local_pdf))
         cache_key = safe_key(local_pdf.stem)
 
-    parsed_path = Path(args.cache_dir) / "parsed" / f"{cache_key}.json"
-    images_dir = Path(args.cache_dir) / "images" / cache_key
+    paper_root = Path(args.cache_dir) / cache_key
+    parsed_path = paper_root / "parsed" / f"{cache_key}.json"
+    images_dir = paper_root / "images"
 
     if args.verbose:
         print("Backend: skill-parser")
@@ -2449,6 +2645,7 @@ def main() -> None:
         print(f"Image backend: {fetcher.last_image_backend}")
         if fetcher.last_source_status:
             print(f"TeX source status: {fetcher.last_source_status}")
+        print(f"Paper dir: {paper_root.as_posix()}")
 
     print(f"Parsed cache: {parsed_path.as_posix()}")
     print(f"Images dir: {images_dir.as_posix()}")

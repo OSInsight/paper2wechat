@@ -59,3 +59,10 @@ If top-1 and top-2 are close, prefer readability and audience fit over strict la
 - Headings remain scannable in WeChat.
 - Wording does not drift into another style.
 - If hybrid style is used, transitions are natural and not contradictory.
+
+## Structure Suggestion By Style
+
+- `academic-science`: add `实验设置/复现细节/误差分析` style blocks.
+- `academic-tech`: add `系统架构/实现细节/性能与成本权衡` style blocks.
+- `academic-trend`: add `趋势判断/行业影响/未来观察点` style blocks.
+- `academic-applied`: add `应用场景/上线路径/KPI与ROI` style blocks.

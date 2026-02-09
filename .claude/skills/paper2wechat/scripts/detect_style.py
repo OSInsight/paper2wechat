@@ -288,7 +288,7 @@ def recommend_style(text: str, intent_hint: str = "") -> Dict[str, Any]:
         decision_hint = "agent_decide_freely"
 
     return {
-        "recommended_style": top_style,  # keep for compatibility with older callers
+        "recommended_style": top_style,
         "confidence": confidence,
         "confidence_band": band,
         "reason_signals": explanation,
