@@ -1,8 +1,12 @@
-"""
-Paper fetching module - handles URL and PDF input
+#!/usr/bin/env python
+"""Standalone parser for paper2wechat skill.
+
+This script vendors the proven parsing/image-extraction implementation from the
+original core fetcher, while remaining self-contained inside the skill package.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -10,24 +14,20 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from .models import ImageInfo, Paper, Section
-from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import requests
-except ImportError:  # pragma: no cover - requests should exist in runtime deps.
+except ImportError:  # pragma: no cover
     requests = None
 
 try:
     import fitz  # PyMuPDF
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover
     fitz = None
-
-
-class FetchError(RuntimeError):
-    """Raised when paper fetching/parsing fails."""
 
 
 ARXIV_ID_PATTERN = re.compile(
@@ -36,8 +36,40 @@ ARXIV_ID_PATTERN = re.compile(
 )
 
 
+@dataclass
+class ImageInfo:
+    url: str
+    caption: str
+    position: int
+    relevance_score: float = 0.5
+
+
+@dataclass
+class Section:
+    title: str
+    content: str
+    level: int = 1
+
+
+@dataclass
+class Paper:
+    title: str
+    authors: List[str] = field(default_factory=list)
+    abstract: str = ""
+    published_date: Optional[datetime] = None
+    arxiv_id: Optional[str] = None
+    pdf_url: Optional[str] = None
+    sections: List[Section] = field(default_factory=list)
+    images: List[ImageInfo] = field(default_factory=list)
+    url: Optional[str] = None
+
+
+class FetchError(RuntimeError):
+    """Raised when paper fetching/parsing fails."""
+
+
 class PaperFetcher:
-    """Fetch paper content from various sources"""
+    """Fetch paper content from arXiv or local PDF."""
 
     def __init__(self, cache_dir: str = ".paper2wechat", timeout: int = 30):
         self.timeout = timeout
@@ -49,21 +81,8 @@ class PaperFetcher:
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.parsed_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
-    
+
     def fetch_from_url(self, url: str) -> Paper:
-        """
-        Fetch paper from Arxiv URL
-        
-        Args:
-            url: Arxiv URL (https://arxiv.org/abs/XXXX.XXXXX)
-        
-        Returns:
-            Paper object with extracted content
-        
-        Raises:
-            ValueError: If URL is invalid
-            ConnectionError: If unable to fetch
-        """
         arxiv_id = self.parse_arxiv_url(url)
         metadata = self._fetch_arxiv_metadata(arxiv_id)
 
@@ -73,7 +92,7 @@ class PaperFetcher:
         paper = self.fetch_from_pdf(
             str(pdf_path),
             arxiv_id=arxiv_id,
-            source_url=url,
+            source_url=f"https://arxiv.org/abs/{arxiv_id}",
         )
 
         paper.title = metadata.get("title") or paper.title
@@ -81,37 +100,24 @@ class PaperFetcher:
         paper.authors = metadata.get("authors") or paper.authors
         paper.published_date = metadata.get("published_date") or paper.published_date
         paper.pdf_url = pdf_url
-        paper.url = url
+        paper.url = f"https://arxiv.org/abs/{arxiv_id}"
 
         self._save_parsed_cache(paper, cache_key=arxiv_id)
         return paper
-    
+
     def fetch_from_pdf(
         self,
         pdf_path: str,
         arxiv_id: Optional[str] = None,
         source_url: Optional[str] = None,
     ) -> Paper:
-        """
-        Fetch paper from local PDF file
-        
-        Args:
-            pdf_path: Path to PDF file
-        
-        Returns:
-            Paper object with extracted content
-        
-        Raises:
-            FileNotFoundError: If PDF not found
-            IOError: If PDF cannot be read
-        """
         pdf_file = Path(pdf_path).expanduser().resolve()
         if not pdf_file.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_file}")
 
         try:
             from pypdf import PdfReader
-        except Exception as exc:  # pragma: no cover - dependency issue
+        except Exception as exc:  # pragma: no cover
             raise FetchError("pypdf is required for PDF parsing.") from exc
 
         try:
@@ -160,6 +166,7 @@ class PaperFetcher:
         sections = self._split_sections(full_text)
         abstract = self._extract_abstract(full_text)
         cache_key = arxiv_id or pdf_file.stem
+
         images = self._extract_figures_by_caption(
             pdf_path=pdf_file,
             cache_key=cache_key,
@@ -170,8 +177,6 @@ class PaperFetcher:
                 cache_key=cache_key,
             )
         if not images:
-            # Last-resort fallback: avoid exporting all embedded images (often many tiny fragments).
-            # Prefer extracting a small number of large figure-like regions.
             images = self._extract_largest_figures_with_fitz(
                 pdf_path=pdf_file,
                 cache_key=cache_key,
@@ -194,118 +199,19 @@ class PaperFetcher:
         self._save_parsed_cache(paper, cache_key=cache_key)
         return paper
 
-    def _extract_largest_figures_with_fitz(
-        self,
-        pdf_path: Path,
-        cache_key: str,
-        max_images: int = 8,
-    ) -> List[ImageInfo]:
-        """Fallback extractor: pick a bounded set of large image regions.
-
-        Some PDFs don't expose Figure captions cleanly, and exporting all embedded
-        images yields many tiny fragments (icons, glyphs, patches). This method
-        uses PyMuPDF's image rectangles to crop only the largest regions.
-        """
-        if fitz is None or max_images <= 0:
-            return []
-
-        paper_image_dir = self._prepare_image_dir(cache_key=cache_key, reset=True)
-        extracted: List[ImageInfo] = []
-
-        try:
-            document = fitz.open(str(pdf_path))
-        except Exception:
-            return []
-
-        try:
-            candidates: List[tuple[float, int, Any]] = []  # (area, page_index, rect)
-            for page_index in range(document.page_count):
-                page = document.load_page(page_index)
-                page_rect = page.rect
-                header_cutoff = page_rect.y0 + page_rect.height * 0.10
-                rects = self._collect_fitz_image_rects(page)
-                for rect in rects:
-                    if rect.y0 < header_cutoff:
-                        continue
-                    if rect.width < page_rect.width * 0.20:
-                        continue
-                    if rect.height < page_rect.height * 0.06:
-                        continue
-                    area = rect.width * rect.height
-                    candidates.append((area, page_index, rect))
-
-            if not candidates:
-                return []
-
-            # Keep only the largest regions overall.
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            selected = candidates[: max_images * 2]  # extra for dedup/size filters
-
-            seq = 1
-            for _, page_index, rect in selected:
-                page = document.load_page(page_index)
-                page_rect = page.rect
-                header_cutoff = page_rect.y0 + page_rect.height * 0.10
-
-                pad_x = max(page_rect.width * 0.01, rect.width * 0.02)
-                pad_y = max(page_rect.height * 0.01, rect.height * 0.03)
-                clip = fitz.Rect(
-                    max(page_rect.x0, rect.x0 - pad_x),
-                    max(header_cutoff, rect.y0 - pad_y),
-                    min(page_rect.x1, rect.x1 + pad_x),
-                    min(page_rect.y1, rect.y1 + pad_y),
-                )
-
-                try:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), clip=clip, alpha=False)
-                except Exception:
-                    continue
-
-                if pix.width * pix.height < 220000:
-                    continue
-
-                output_path = paper_image_dir / f"page_{page_index + 1:03d}_{seq:03d}.png"
-                try:
-                    pix.save(str(output_path))
-                except Exception:
-                    continue
-
-                extracted.append(
-                    ImageInfo(
-                        url=str(output_path.as_posix()),
-                        caption=f"Figure (page {page_index + 1})",
-                        position=seq,
-                        relevance_score=self._estimate_caption_image_relevance(
-                            page_index=page_index,
-                            clip_height=clip.height,
-                        ),
-                    )
-                )
-                seq += 1
-
-                if len(extracted) >= max_images:
-                    break
-        finally:
-            document.close()
-
-        return self._deduplicate_images(extracted)
-    
     @staticmethod
     def parse_arxiv_url(url: str) -> str:
-        """Extract arxiv ID from URL"""
         value = (url or "").strip()
         if not value:
             raise ValueError("Arxiv URL/ID cannot be empty.")
 
-        # Accept bare IDs like 2301.00000 or cs/0112017.
         if ARXIV_ID_PATTERN.fullmatch(value):
             return value
 
         if "arxiv.org" in value:
             match = ARXIV_ID_PATTERN.search(value)
             if match:
-                arxiv_id = match.group("id")
-                return arxiv_id.removesuffix(".pdf")
+                return match.group("id").removesuffix(".pdf")
 
         raise ValueError(f"Invalid Arxiv URL or ID: {url}")
 
@@ -403,7 +309,7 @@ class PaperFetcher:
                 }
                 for image in paper.images
             ],
-            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "saved_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
         cache_path.write_text(
@@ -412,7 +318,7 @@ class PaperFetcher:
         )
 
     def _http_get(self, url: str) -> bytes:
-        headers = {"User-Agent": "paper2wechat/0.1.0"}
+        headers = {"User-Agent": "paper2wechat-skill/1.0"}
 
         if requests is not None:
             try:
@@ -546,11 +452,10 @@ class PaperFetcher:
                 output_path = paper_image_dir / f"page_{page_idx + 1:03d}_{seq:03d}{ext}"
                 output_path.write_bytes(bytes(data))
 
-                caption = f"Figure {seq} (page {page_idx + 1})"
                 extracted.append(
                     ImageInfo(
                         url=str(output_path.as_posix()),
-                        caption=caption,
+                        caption=f"Figure {seq} (page {page_idx + 1})",
                         position=seq,
                         relevance_score=self._estimate_image_relevance(
                             page_index=page_idx,
@@ -560,6 +465,95 @@ class PaperFetcher:
                     )
                 )
                 seq += 1
+
+        return self._deduplicate_images(extracted)
+
+    def _extract_largest_figures_with_fitz(
+        self,
+        pdf_path: Path,
+        cache_key: str,
+        max_images: int = 8,
+    ) -> List[ImageInfo]:
+        if fitz is None or max_images <= 0:
+            return []
+
+        paper_image_dir = self._prepare_image_dir(cache_key=cache_key, reset=True)
+        extracted: List[ImageInfo] = []
+
+        try:
+            document = fitz.open(str(pdf_path))
+        except Exception:
+            return []
+
+        try:
+            candidates: List[Tuple[float, int, Any]] = []
+            for page_index in range(document.page_count):
+                page = document.load_page(page_index)
+                page_rect = page.rect
+                header_cutoff = page_rect.y0 + page_rect.height * 0.10
+                rects = self._collect_fitz_image_rects(page)
+                for rect in rects:
+                    if rect.y0 < header_cutoff:
+                        continue
+                    if rect.width < page_rect.width * 0.20:
+                        continue
+                    if rect.height < page_rect.height * 0.06:
+                        continue
+                    area = rect.width * rect.height
+                    candidates.append((area, page_index, rect))
+
+            if not candidates:
+                return []
+
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            selected = candidates[: max_images * 2]
+
+            seq = 1
+            for _, page_index, rect in selected:
+                page = document.load_page(page_index)
+                page_rect = page.rect
+                header_cutoff = page_rect.y0 + page_rect.height * 0.10
+
+                pad_x = max(page_rect.width * 0.01, rect.width * 0.02)
+                pad_y = max(page_rect.height * 0.01, rect.height * 0.03)
+                clip = fitz.Rect(
+                    max(page_rect.x0, rect.x0 - pad_x),
+                    max(header_cutoff, rect.y0 - pad_y),
+                    min(page_rect.x1, rect.x1 + pad_x),
+                    min(page_rect.y1, rect.y1 + pad_y),
+                )
+
+                try:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), clip=clip, alpha=False)
+                except Exception:
+                    continue
+
+                if pix.width * pix.height < 220000:
+                    continue
+
+                output_path = paper_image_dir / f"page_{page_index + 1:03d}_{seq:03d}.png"
+                try:
+                    pix.save(str(output_path))
+                except Exception:
+                    continue
+
+                extracted.append(
+                    ImageInfo(
+                        url=str(output_path.as_posix()),
+                        caption=f"Figure (page {page_index + 1})",
+                        position=seq,
+                        relevance_score=self._estimate_caption_image_relevance(
+                            page_index=page_index,
+                            clip_height=clip.height,
+                        ),
+                    )
+                )
+                seq += 1
+
+                if len(extracted) >= max_images:
+                    break
+        finally:
+            document.close()
 
         return self._deduplicate_images(extracted)
 
@@ -585,8 +579,6 @@ class PaperFetcher:
 
                 page_rect = page.rect
                 header_cutoff = page_rect.y0 + page_rect.height * 0.10
-                # For aesthetics, we sometimes want a bit of top whitespace.
-                # However, we still must avoid pulling in page headers.
                 header_guard = page_rect.y0 + page_rect.height * 0.06
                 relaxed_header_cutoff = max(header_guard, header_cutoff - page_rect.height * 0.03)
                 image_rects = self._collect_fitz_image_rects(page)
@@ -601,9 +593,6 @@ class PaperFetcher:
                     if clip is None:
                         continue
 
-                    # If the initial bbox is too small (common when the PDF encodes
-                    # diagrams as many small image objects), prefer a broader window
-                    # above the caption.
                     if clip.width < 120 or clip.height < 80:
                         alt_top = max(header_cutoff, cap_rect.y0 - page_rect.height * 0.60)
                         alt_bottom = cap_rect.y0 - 2
@@ -617,9 +606,6 @@ class PaperFetcher:
                             continue
                         clip = alt
 
-                    # Add a bit of whitespace around the extracted region.
-                    # Keep a small gap above the caption so we don't capture caption text,
-                    # but allow enough breathing room for WeChat layout.
                     bottom_limit = cap_rect.y0 - max(2.0, page_rect.height * 0.003)
                     pad_x = max(page_rect.width * 0.012, clip.width * 0.020)
                     pad_y = max(page_rect.height * 0.012, clip.height * 0.030)
@@ -634,9 +620,6 @@ class PaperFetcher:
 
                     pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), clip=clip, alpha=False)
                     if pix.width * pix.height < 180000:
-                        # The bbox selection can latch onto a small embedded image close
-                        # to the caption (e.g., icons, panel labels). Retry with a broader
-                        # fallback window above the caption to capture the full figure.
                         alt_top = max(header_cutoff, cap_rect.y0 - page_rect.height * 0.60)
                         alt_bottom = cap_rect.y0 - 2
                         alt = fitz.Rect(
@@ -662,11 +645,10 @@ class PaperFetcher:
                     output_path = paper_image_dir / f"page_{page_index + 1:03d}_{seq:03d}.png"
                     pix.save(str(output_path))
 
-                    caption_text = caption["text"]
                     extracted.append(
                         ImageInfo(
                             url=str(output_path.as_posix()),
-                            caption=caption_text,
+                            caption=caption["text"],
                             position=seq,
                             relevance_score=self._estimate_caption_image_relevance(
                                 page_index=page_index,
@@ -719,7 +701,6 @@ class PaperFetcher:
                             continue
 
                         x0, top, x1, bottom = rect
-                        # Add some whitespace around the extracted region.
                         pad_x = max(float(page.width) * 0.015, (x1 - x0) * 0.02)
                         pad_y = max(float(page.height) * 0.015, (bottom - top) * 0.03)
                         bottom_limit = cap_top - max(2.0, float(page.height) * 0.003)
@@ -807,9 +788,6 @@ class PaperFetcher:
         if candidates:
             _, _, best = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
 
-            # Merge nearby large rectangles to avoid cropping only one panel of a
-            # multi-panel figure (common when a figure is composed of multiple
-            # image objects).
             cluster: List[Any] = [best]
             for rect in image_rects:
                 if rect is best:
@@ -853,7 +831,6 @@ class PaperFetcher:
                 min(caption_rect.y0 - 2, best.y1 + pad_y),
             )
 
-        # Merge fragmented image objects (common in vector-heavy PDFs).
         fragment_pool: List[Any] = []
         for rect in image_rects:
             if rect.y1 > cap_top + 4:
@@ -879,8 +856,6 @@ class PaperFetcher:
             union_w = union_x1 - union_x0
             union_h = union_y1 - union_y0
             if union_w >= page_rect.width * 0.28 and union_h >= page_rect.height * 0.10:
-                # Guard against sparse "fragments" (icons / markers) whose union box
-                # looks large but doesn't cover the actual (often vector) figure.
                 union_area = max(union_w * union_h, 1.0)
                 covered_area = sum(rect.width * rect.height for rect in fragment_pool)
                 coverage = covered_area / union_area
@@ -894,8 +869,6 @@ class PaperFetcher:
                         min(caption_rect.y0 - 2, union_y1 + pad_y),
                     )
 
-        # Fallback region if we cannot bind to an image object.
-        # Use a taller window to reduce the chance of cutting off vector-heavy figures.
         top = max(header_cutoff, cap_top - page_rect.height * 0.55)
         bottom = cap_top - 2
         if bottom - top < 90:
@@ -909,13 +882,46 @@ class PaperFetcher:
         )
 
     @staticmethod
+    def _find_figure_captions(page: Any) -> List[Dict[str, Any]]:
+        if fitz is None:
+            return []
+
+        captions: List[Dict[str, Any]] = []
+        pattern = re.compile(r"(figure|fig\.?)\s*\d+[\s:.\-]+", re.IGNORECASE)
+
+        try:
+            blocks = page.get_text("blocks")
+        except Exception:
+            return []
+
+        for block in blocks:
+            if len(block) < 5:
+                continue
+            x0, y0, x1, y1, text = block[:5]
+            clean = re.sub(r"\s+", " ", str(text or "")).strip()
+            if not clean:
+                continue
+
+            match = pattern.search(clean)
+            if not match:
+                continue
+            if match.start() > 18:
+                continue
+
+            captions.append(
+                {
+                    "text": clean[match.start() : match.start() + 160],
+                    "rect": fitz.Rect(x0, y0, x1, y1),
+                }
+            )
+
+        captions.sort(key=lambda item: item["rect"].y0)
+        return captions
+
+    @staticmethod
     def _find_figure_captions_from_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not words:
             return []
-        # Captions often start with optional panel markers like "(a) (b) (c)",
-        # so we search for Figure/Fig near the beginning of the line.
-        # We also avoid in-paragraph references like "as shown in Figure 1" by
-        # requiring the match to occur close to the start.
         pattern = re.compile(r"(figure|fig\.?)\s*\d+[\s:._\-]+", re.IGNORECASE)
 
         grouped: Dict[int, List[Dict[str, Any]]] = {}
@@ -955,8 +961,8 @@ class PaperFetcher:
         page_height: float,
         header_cutoff: float,
         image_boxes: List[Dict[str, Any]],
-    ) -> Optional[tuple[float, float, float, float]]:
-        candidates: List[tuple[float, float, tuple[float, float, float, float]]] = []
+    ) -> Optional[Tuple[float, float, float, float]]:
+        candidates: List[Tuple[float, float, Tuple[float, float, float, float]]] = []
         for image in image_boxes:
             x0 = float(image.get("x0", 0))
             x1 = float(image.get("x1", 0))
@@ -988,8 +994,7 @@ class PaperFetcher:
                 min(caption_top - 2, bottom + pad_y),
             )
 
-        # Merge fragmented image blocks when no single large block exists.
-        fragments: List[tuple[float, float, float, float]] = []
+        fragments: List[Tuple[float, float, float, float]] = []
         for image in image_boxes:
             x0 = float(image.get("x0", 0))
             x1 = float(image.get("x1", 0))
@@ -1038,45 +1043,6 @@ class PaperFetcher:
             bottom,
         )
 
-    @staticmethod
-    def _find_figure_captions(page: Any) -> List[Dict[str, Any]]:
-        if fitz is None:
-            return []
-
-        captions: List[Dict[str, Any]] = []
-        # Captions can be prefixed by panel labels like "(a) (b)"; detect Figure/Fig
-        # near the start of the text block and ignore in-paragraph references.
-        pattern = re.compile(r"(figure|fig\.?)\s*\d+[\s:.\-]+", re.IGNORECASE)
-
-        try:
-            blocks = page.get_text("blocks")
-        except Exception:
-            return []
-
-        for block in blocks:
-            if len(block) < 5:
-                continue
-            x0, y0, x1, y1, text = block[:5]
-            clean = re.sub(r"\s+", " ", str(text or "")).strip()
-            if not clean:
-                continue
-
-            match = pattern.search(clean)
-            if not match:
-                continue
-            if match.start() > 18:
-                continue
-
-            captions.append(
-                {
-                    "text": clean[match.start() : match.start() + 160],
-                    "rect": fitz.Rect(x0, y0, x1, y1),
-                }
-            )
-
-        captions.sort(key=lambda item: item["rect"].y0)
-        return captions
-
     def _prepare_image_dir(self, cache_key: str, reset: bool = False) -> Path:
         safe_key = cache_key.replace("/", "_")
         paper_image_dir = self.images_dir / safe_key
@@ -1110,7 +1076,7 @@ class PaperFetcher:
 
     @staticmethod
     def _hash_file(path: Path) -> str:
-        digest = hashlib.md5()  # noqa: S324 - used only for duplicate detection.
+        digest = hashlib.md5()  # noqa: S324 - dedupe only
         with path.open("rb") as file_obj:
             while True:
                 chunk = file_obj.read(8192)
@@ -1208,3 +1174,73 @@ class PaperFetcher:
         position_bonus = max(0.0, 0.2 - image_index * 0.02)
         score = 0.2 + size_bonus + page_bonus + position_bonus
         return round(min(score, 1.0), 3)
+
+
+def parse_input(source: str) -> Tuple[str, Optional[str], Optional[Path]]:
+    raw = (source or "").strip()
+    if not raw:
+        raise ValueError("Input cannot be empty.")
+
+    local_path = Path(raw).expanduser()
+    if local_path.exists() and local_path.is_file():
+        if local_path.suffix.lower() != ".pdf":
+            raise ValueError(f"Only PDF file is supported for local input: {raw}")
+        return "pdf", None, local_path.resolve()
+
+    if ARXIV_ID_PATTERN.fullmatch(raw):
+        return "arxiv", raw, None
+
+    if "arxiv.org" in raw:
+        match = ARXIV_ID_PATTERN.search(raw)
+        if not match:
+            raise ValueError(f"Invalid Arxiv URL: {raw}")
+        arxiv_id = match.group("id")
+        if arxiv_id.endswith(".pdf"):
+            arxiv_id = arxiv_id[: -len(".pdf")]
+        return "arxiv", arxiv_id, None
+
+    if raw.lower().endswith(".pdf"):
+        raise FileNotFoundError(f"PDF not found: {raw}")
+
+    raise ValueError(f"Unsupported input: {raw}")
+
+
+def safe_key(value: str) -> str:
+    return (value or "paper").replace("/", "_")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Standalone parser for Arxiv paper/PDF.")
+    parser.add_argument("input", help="Arxiv URL/ID or local PDF path")
+    parser.add_argument("--cache-dir", default=".paper2wechat", help="Cache directory")
+    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    args = parser.parse_args()
+
+    mode, arxiv_id, local_pdf = parse_input(args.input.strip())
+    fetcher = PaperFetcher(cache_dir=args.cache_dir)
+
+    if mode == "arxiv":
+        assert arxiv_id is not None
+        paper = fetcher.fetch_from_url(f"https://arxiv.org/abs/{arxiv_id}")
+        cache_key = safe_key(arxiv_id)
+    else:
+        assert local_pdf is not None
+        paper = fetcher.fetch_from_pdf(str(local_pdf))
+        cache_key = safe_key(local_pdf.stem)
+
+    parsed_path = Path(args.cache_dir) / "parsed" / f"{cache_key}.json"
+    images_dir = Path(args.cache_dir) / "images" / cache_key
+
+    if args.verbose:
+        print("Backend: skill-parser")
+        print(f"Source: {args.input}")
+        print(f"Title: {paper.title}")
+        print(f"Sections: {len(paper.sections)}")
+        print(f"Images extracted: {len(paper.images)}")
+
+    print(f"Parsed cache: {parsed_path.as_posix()}")
+    print(f"Images dir: {images_dir.as_posix()}")
+
+
+if __name__ == "__main__":
+    main()

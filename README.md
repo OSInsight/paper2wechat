@@ -1,316 +1,59 @@
-# Paper2WeChat 📄➡️📱
+# paper2wechat (Skill Workflow)
 
-Convert Arxiv papers to WeChat Official Account articles with practical summarization, PDF image extraction, and style adaptation.
+This repository is now maintained as a **skill-first project** for converting Arxiv papers into WeChat-ready articles.
 
-> **🤖 For AI Agents**: If you're an AI assistant helping a user with this tool, see [`.claude/skills/paper2wechat/SKILL.md`](.claude/skills/paper2wechat/SKILL.md) for agent-specific instructions.
->
-> **👤 For Human Users**: Continue reading below for CLI, API, and development documentation.
+The skill lives at:
+- `.claude/skills/paper2wechat/SKILL.md`
 
-[中文版本](README.zh.md)
+## Workflow
 
-## ✨ Features
+This repository uses a skill-driven agent workflow.
 
-- 🔗 **Auto Paper Parsing** - Direct from Arxiv URL or local PDF
-- 📸 **PDF Image Extraction** - Extract paper figures from PDF and insert into markdown
-- 🎨 **Multiple Styles** - Academic-science, academic-tech, academic-trend, academic-applied
-- 📝 **Content Adaptation** - Intelligent summarization and language conversion
-- ⚡ **One-Click Publishing** - Direct integration with WeChat and md2wechat
-- 🐍 **Python API** - Embed in your own applications
-- 🛠️ **CLI Tool** - Command-line interface for quick usage
-- 🤖 **AI Skill** - Natural language interaction via Claude
+## Quick Start (Skill Workflow)
 
-## 🚀 Quick Start
-
-### Installation
+1. Parse paper and extract figures:
 
 ```bash
-# From PyPI (coming soon)
-pip install paper2wechat
-
-# From source
-git clone https://github.com/OSInsight/paper2wechat.git
-cd paper2wechat
-pip install -e .
+bash .claude/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv_url_or_id_or_pdf>" ".paper2wechat"
 ```
 
-### Usage
-
-#### 1. CLI - Simplest Way
+2. Generate style evidence from parsed content (Agent makes final style decision):
 
 ```bash
-# Most basic usage
-paper2wechat https://arxiv.org/abs/2301.00000
-# Default output: outputs/2301.00000.md
-
-# With options
-paper2wechat https://arxiv.org/abs/2301.00000 \
-  --style academic-tech \
-  --images 5 \
-  --max-length 4500 \
-  --output outputs/article.md \
-  --preview
-
-# Upload to WeChat draft
-paper2wechat https://arxiv.org/abs/2301.00000 --draft --cover
-
-# From local PDF
-paper2wechat ./paper.pdf --style academic-science
+python .claude/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
 ```
 
-Note: CLI mode requires `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY` by default.  
-If you explicitly accept lower-quality rule-based rewriting, add `--allow-rule-based`.
+3. Let agent generate WeChat article from parsed JSON and template:
+- Template: `.claude/skills/paper2wechat/references/article-template.md`
+- Recommended output: `.paper2wechat/outputs/<paper_id>.md`
+- When output is under `.paper2wechat/outputs`, image links should use `../images/<paper_id>/<image_file>`.
 
-#### 2. Python API
+## Skill Packaging Layout
 
-```python
-from paper2wechat import PaperConverter
-
-# Initialize converter
-converter = PaperConverter(style="academic-tech", max_images=5)
-
-# Convert from Arxiv
-article = converter.convert("https://arxiv.org/abs/2301.00000")
-
-# Or from PDF
-article = converter.convert_pdf("./paper.pdf")
-
-# Output as Markdown
-markdown = article.to_markdown()
-article.save_markdown("output.md")
-
-# Preview
-print(article.preview())
-
-# Upload to WeChat (requires config)
-converter.upload_to_wechat(article, draft=True)
+```text
+.claude/skills/paper2wechat/
+├── SKILL.md
+├── agents/openai.yaml
+├── scripts/
+│   ├── fetch_paper.sh
+│   ├── parse_paper.py
+│   └── detect_style.py
+└── references/
+    ├── style-guide.md
+    └── article-template.md
 ```
 
-#### 3. AI Skill (via Claude)
+## Runtime Dependencies
 
-```
-You: "Help me convert this paper to a WeChat article"
-Link: https://arxiv.org/abs/2301.00000
+Recommended Python dependencies for parsing:
+- `pypdf`
+- `pdfplumber`
+- `PyMuPDF` (optional but recommended for better figure extraction)
+- `Pillow`
 
-Claude: [Using paper2wechat skill to process]
-1. Fetching paper content...
-2. Analyzing structure...
-3. Selecting key images...
-4. Generating markdown...
-5. Ready for preview or publishing
-```
+## Notes For Skill Marketplace Publishing
 
-You can also use agent mode (no manual CLI parameter wiring):
-
-```bash
-bash skills/paper2wechat/scripts/run.sh agent "Convert this paper to a WeChat post: https://arxiv.org/abs/2510.21603"
-```
-
-In chat-agent workflow, API key is not mandatory; the coding agent can write the final Chinese article from parsed context.
-
-## 🎯 Architecture
-
-```
-Arxiv URL/PDF
-    ↓
-[Paper Fetcher]
-    ↓
-[Content Parser] → Extract title, abstract, key sections, figures
-    ↓
-[Image Processor] → Identify, select, and prepare images
-    ↓
-[Content Adapter] → Summarize, convert to accessible language
-    ↓
-[Style Engine] → Apply chosen style (science/tech/trend/applied)
-    ↓
-[Markdown Generator] → Generate WeChat-compatible markdown
-    ↓
-Output: .md file → [md2wechat] → WeChat article
-```
-
-## 📚 Documentation
-
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Full architecture explanation
-- [docs/API.md](docs/API.md) - Python API reference
-- [docs/STYLES.md](docs/STYLES.md) - Style definitions and examples
-- [skills/paper2wechat/SKILL.md](skills/paper2wechat/SKILL.md) - AI Skill guide
-- [CLAUDE.md](CLAUDE.md) - Project design document (for AI assistant context)
-
-## 🎨 Available Styles
-
-| Style                | Description                                   | Best For                                  |
-| -------------------- | --------------------------------------------- | ----------------------------------------- |
-| **academic-science** | Scientific rigor, understandable explanations | AI algorithms, fundamental science        |
-| **academic-tech**    | Technical insights, developer-friendly        | Engineering, frameworks, tools            |
-| **academic-trend**   | Future-focused, emphasizes innovation         | Emerging fields, breakthrough discoveries |
-| **academic-applied** | Practical applications, real-world impact     | Industry applications, use cases          |
-
-## 🔌 Integration
-
-### With md2wechat
-Seamless integration with [md2wechat](https://github.com/geekjourneyx/md2wechat-skill) for publishing:
-
-```bash
-# Generate markdown
-paper2wechat https://arxiv.org/abs/2301.00000 --output outputs/article.md
-
-# Then publish via md2wechat
-bash md2wechat/scripts/run.sh convert outputs/article.md --draft --cover cover.jpg
-```
-
-## 📁 Output & Cache
-
-By default, generated artifacts are saved in:
-
-- `outputs/<paper-id>.md` - final markdown
-- `.paper2wechat/downloads/` - downloaded Arxiv PDFs
-- `.paper2wechat/parsed/` - parsed structured JSON
-- `.paper2wechat/images/<paper-id>/` - extracted raw images from PDF
-- `outputs/assets/<markdown-name>/` - images copied for markdown display
-
-## 🛠️ Configuration
-
-### Environment Variables
-
-```bash
-# For LLM rewriting (recommended)
-export OPENROUTER_API_KEY=your_openrouter_key
-export OPENROUTER_MODEL=anthropic/claude-3.5-sonnet
-# Optional: custom OpenRouter endpoint and app identity headers
-export OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-export OPENROUTER_SITE_URL=https://your-site.example
-export OPENROUTER_APP_NAME=paper2wechat
-
-# Optional fallback for direct Anthropic API
-export ANTHROPIC_API_KEY=your_anthropic_key
-
-# For WeChat publishing (optional)
-export WECHAT_APPID=your_appid
-export WECHAT_SECRET=your_secret
-
-# For image API (optional)
-export IMAGE_API_KEY=your_key
-export IMAGE_API_BASE=your_api_base
-
-# For custom styles
-export PAPER2WECHAT_STYLES_DIR=/path/to/custom/styles
-```
-
-### Config File
-
-Create `~/.paper2wechat/config.yaml`:
-
-```yaml
-wechat:
-  appid: your_appid
-  secret: your_secret
-
-image:
-  api_key: your_key
-  max_width: 1920
-  auto_compress: true
-
-defaults:
-  style: academic-tech
-  max_images: 5
-```
-
-## 📦 Project Structure
-
-```
-paper2wechat/
-├── CLAUDE.md                         # Design document for AI
-├── README.md                         # This file
-├── setup.py                          # Python package setup
-├── requirements.txt                  # Dependencies
-│
-├── paper2wechat/
-│   ├── __init__.py
-│   └── core/                         # Core modules
-│       ├── cli.py                    # CLI entrypoint
-│       ├── paper_fetcher.py          # URL/PDF fetch + parse + image extraction
-│       ├── content_adapter.py        # Adapt content for WeChat
-│       ├── image_processor.py        # Rank/select/compress images
-│       ├── converter.py              # End-to-end conversion pipeline
-│       ├── models.py                 # Data models
-│       └── markdown_generator.py     # Generate markdown
-│
-├── skills/                           # Claude Skill definition
-│   └── paper2wechat/
-│       ├── SKILL.md                 # Skill documentation
-│       ├── references/
-│       │   ├── academic-styles.md
-│       │   ├── arxiv-guide.md
-│       │   └── examples.md
-│       └── scripts/
-│           └── run.sh               # CLI wrapper
-│
-├── prompts/                          # Prompt templates
-│   ├── arxiv_parser.md
-│   ├── content_adapter.md
-│   ├── academic_styles.md
-│   └── image_selector.md
-│
-├── examples/                         # Usage examples
-│   ├── sample-arxiv.txt
-│   └── output-example.md
-│
-├── tests/                            # Tests
-│   ├── test_paper_fetcher.py
-│   ├── test_content_adapter.py
-│   └── test_integration.py
-│
-└── docs/                             # Detailed documentation
-    ├── ARCHITECTURE.md
-    ├── API.md
-    ├── STYLES.md
-    └── INTEGRATION.md
-```
-
-## 🚀 Roadmap
-
-### Phase 1 (MVP) ✓ In Progress
-- [x] Support Arxiv URL fetching
-- [x] Basic content extraction and adaptation
-- [x] 1-2 default styles
-- [x] Output as markdown
-- [ ] md2wechat integration (depends on external repo/config)
-
-### Phase 2 - Enhanced
-- [x] Basic PDF image extraction and markdown insertion
-- [ ] Smart image recognition and selection
-- [ ] 5+ academic styles
-- [ ] Table auto-detection
-- [ ] Local PDF + web sources
-- [ ] Batch processing
-
-### Phase 3 - Advanced
-- [ ] AI trace removal (humanizer)
-- [ ] Auto cover generation
-- [ ] Content analysis scoring
-- [ ] Publishing schedule
-- [ ] Style customization UI
-
-## 🤝 Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## 📄 License
-
-MIT License - See [LICENSE](LICENSE) for details.
-
-## 🙏 Acknowledgments
-
-- [md2wechat](https://github.com/geekjourneyx/md2wechat-skill) - Smart WeChat publishing
-- [PDF Skill](https://github.com/anthropics/skills) - Robust PDF processing
-- [pdfplumber](https://github.com/jsvine/pdfplumber) - Text extraction
-- [Anthropic Claude](https://www.anthropic.com/) - AI powering the conversion
-
-## 📧 Support
-
-- Open an issue on GitHub
-- Check existing [FAQ](docs/FAQ.md)
-- Read [TROUBLESHOOTING](docs/TROUBLESHOOTING.md)
-
----
-
-**Made with ❤️ for the academic community**
+- Keep trigger description in `SKILL.md` explicit and specific.
+- Keep `agents/openai.yaml` in sync with `SKILL.md` intent.
+- Prefer script-backed deterministic steps (`scripts/`) over long prompt-only logic.
+- Keep reference docs small and focused (`references/`).

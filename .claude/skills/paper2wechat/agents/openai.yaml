@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper2WeChat"
+  short_description: "Convert Arxiv papers to WeChat posts with adaptive style"
+  default_prompt: "Use $paper2wechat to parse this paper, auto-recommend a style from content, and then generate a WeChat-ready Chinese article with practical summary and extracted figures."

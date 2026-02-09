@@ -1,114 +1,45 @@
-# Contributing to Paper2WeChat
+# Contributing to paper2wechat (Skill-Only)
 
-We welcome contributions to help make paper2wechat better!
+This repository is skill-first.
 
-## Getting Started
+Primary contribution target:
+- `.claude/skills/paper2wechat/`
 
-1. **Fork the repository** on GitHub
-2. **Clone your fork** locally
-3. **Create a feature branch**: `git checkout -b feature/your-feature`
-4. **Make your changes** and test thoroughly
-5. **Submit a pull request** with a clear description
+## What To Contribute
 
-## Development Setup
+- Improve skill triggering and workflow clarity in `SKILL.md`.
+- Improve deterministic scripts in `scripts/`.
+- Improve writing/style references in `references/`.
+- Keep `agents/openai.yaml` aligned with skill behavior.
+
+## Local Setup
 
 ```bash
-# Clone your fork
-git clone https://github.com/yourname/paper2wechat.git
-cd paper2wechat
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install in development mode
-pip install -e .
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-
-# Install development tools (optional but recommended)
-pip install pytest black flake8 mypy
 ```
 
-## Code Style
+## Validation Checklist
 
-- Use **Python 3.8+** syntax
-- Follow **PEP 8** style guide
-- Add **type hints** to functions
-- Write **docstrings** for modules and classes
-- Keep functions focused and well-named
-
-### Format your code
+1. `SKILL.md` frontmatter is valid (`name` and `description`).
+2. Script help output is clear (`--help`).
+3. End-to-end parse flow works:
 
 ```bash
-# Format with black
-black .
-
-# Check with flake8
-flake8 core/
-
-# Type checking
-mypy core/
+bash .claude/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv_url_or_id_or_pdf>" ".paper2wechat"
+python .claude/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
 ```
 
-## Testing
+4. Workflow descriptions reflect current skill behavior.
 
-```bash
-# Run all tests
-pytest
+## Scope Guardrails
 
-# Run with coverage
-pytest --cov=core
+Do not add:
+- unrelated tooling that is not used by the skill workflow
 
-# Run specific test
-pytest tests/test_paper_fetcher.py
-```
+## Pull Requests
 
-## Pull Request Process
-
-1. **Ensure tests pass**: `pytest`
-2. **Update documentation** if needed
-3. **Add a clear description** of your changes
-4. **Reference any related issues**: "Closes #123"
-5. **Wait for review** and respond to feedback
-
-## Areas for Contribution
-
-### High Priority
-- [ ] Paper fetching implementation
-- [ ] Content adaptation with Claude API
-- [ ] Image processing pipeline
-- [ ] Test coverage
-
-### Medium Priority
-- [ ] Additional academic styles
-- [ ] Better error handling
-- [ ] Performance optimization
-- [ ] Documentation improvements
-
-### Low Priority
-- [ ] Nice-to-have features
-- [ ] UI/UX improvements
-- [ ] Example expansions
-
-## Reporting Issues
-
-When reporting bugs, please include:
-- **Description** of the issue
-- **Steps to reproduce**
-- **Expected behavior**
-- **Actual behavior**
-- **Environment** (OS, Python version, etc.)
-
-## Questions?
-
-- Open an issue with the `question` label
-- Check existing issues and discussions
-- See [CLAUDE.md](CLAUDE.md) for project design context
-
-## Code of Conduct
-
-Please be respectful and inclusive. We're building a community together!
-
----
-
-Happy contributing! 🚀
+- Keep changes small and focused.
+- Update README/README.zh if behavior changes.
+- Include before/after notes for skill behavior changes.

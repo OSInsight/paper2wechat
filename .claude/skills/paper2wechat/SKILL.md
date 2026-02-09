@@ -1,383 +1,109 @@
 ---
 name: paper2wechat
-description: Convert Arxiv papers to WeChat Official Account articles. Extracts paper content and images, then rewrites for WeChat audience using multiple academic styles (science, tech, trend, applied).
-metadata: {"openclaw": {"emoji": "📄", "homepage": "https://github.com/OSInsight/paper2wechat"}}
+description: Convert Arxiv papers (URL, Arxiv ID, or local PDF) into WeChat Official Account markdown articles with practical summaries, PDF figure extraction, and auto-recommended writing style based on parsed paper content (academic-science, academic-tech, academic-trend, academic-applied). Use when users ask to解读论文、转公众号文章、提炼可落地要点、自动配图或按受众调整语气和篇幅.
 ---
 
-# Paper to WeChat
+# Paper2WeChat
 
-Converts Arxiv academic papers into WeChat Official Account articles optimized for public engagement.
+Execute this workflow when producing a Chinese WeChat article from an Arxiv paper.
 
-## How It Works
+## Inputs
 
-This is a **hybrid approach**: I use paper2wechat tools to extract and parse the paper, then use my own writing capabilities to create an engaging article.
+Accept one of:
+- Arxiv URL: `https://arxiv.org/abs/2301.00000`
+- Arxiv ID: `2301.00000`
+- Local PDF path: `./paper.pdf`
 
-## Part 1: Fetch and Parse the Paper
+Optionally accept:
+- user preferred style (optional override)
+- max length
+- max images
+- output path
 
-You will be given an Arxiv URL, Arxiv ID, or local PDF file. For example:
+## Step 1: Parse Paper And Extract Figures
 
-```
-https://arxiv.org/abs/2510.21603
-2510.21603
-./paper.pdf
-convert this paper to WeChat: https://arxiv.org/abs/2301.00000
-```
-
-### Step 1a: Normalize the input
-
-Extract and validate:
-- **Arxiv URL** → Extract the ID (e.g., `2510.21603`)
-- **Arxiv ID** → Already have it (e.g., `2510.21603`)
-- **Local PDF** → Get the file path (e.g., `./paper.pdf`)
-
-### Step 1b: Run the fetch tool
-
-From the project root, run:
+Run:
 
 ```bash
-python -m paper2wechat.core.fetch_cli <url_or_id_or_path> --verbose
+bash .claude/skills/paper2wechat/scripts/fetch_paper.sh "<url_or_id_or_pdf>" ".paper2wechat"
 ```
 
-Parameters:
-- `<url_or_id_or_path>` - Arxiv URL, Arxiv ID, or local PDF path
-- `--cache-dir .paper2wechat` - Cache directory (default)
-- `--verbose` - Show detailed progress
+Expect output lines like:
+- `Parsed cache: .paper2wechat/parsed/<paper_id>.json`
+- `Images dir: .paper2wechat/images/<paper_id>`
 
-This will:
-- Download the paper from Arxiv (if needed and not cached)
-- Extract text, structure, title, authors, abstract, sections
-- Parse images and figures from PDF
-- Save parsed data to `.paper2wechat/parsed/{paper_id}.json`
-- Save images to `.paper2wechat/images/{paper_id}/`
+Verify parser output before writing:
+- `title`, `authors`, `abstract`
+- `sections`
+- `images` with `url` and `caption`
 
-**Example output:**
-```
-Parsed cache: .paper2wechat/parsed/2510_21603.json
-Images dir: .paper2wechat/images/2510_21603
-```
+If no images are extracted, continue with text-only article and state that figures were unavailable.
 
-### Step 1c: Verify the tool's output
+## Step 2: Generate Style Evidence For Agent Decision
 
-Check files were created:
-```bash
-ls .paper2wechat/parsed/*.json
-ls .paper2wechat/images/*/
-```
-
-Read the JSON to verify:
-```bash
-cat .paper2wechat/parsed/2510_21603.json | head -50
-```
-
-Content should include:
-- `title` - Paper title
-- `authors` - Author names
-- `abstract` - Paper abstract
-- `sections` - Array of sections with content
-- `images` - Array of image metadata (url, caption, relevance_score)
-
----
-
-## Part 2: Understand User Intent
-
-Extract from the user's original request:
-
-| Parameter | How to Extract | Default |
-|-----------|---|---|
-| **Style** | Keywords: "science/scientific" → academic-science, "tech/engineering" → academic-tech, "trend/future" → academic-trend, "applied/practical" → academic-applied | academic-tech |
-| **Length** | Keywords: "concise/brief/short", "under XXXX chars", or number range | 5000 characters |
-| **Focus** | Keywords: "methodology", "results", "applications", "innovation" | Balanced from abstract & intro |
-
----
-
-## Part 3: Read and Analyze the Paper
-
-### Step 3a: Load the JSON
-
-Read `.paper2wechat/parsed/{paper_id}.json` to access structured data:
-
-```json
-{
-  "title": "...",
-  "authors": [...],
-  "abstract": "...",
-  "sections": [
-    {
-      "title": "Introduction",
-      "content": "...",
-      "level": 1
-    },
-    ...
-  ],
-  "images": [
-    {
-      "url": ".paper2wechat/images/2510_21603/...",
-      "caption": "Fig 1: ..."
-    },
-    ...
-  ]
-}
-```
-
-### Step 3b: Understand the paper deeply
-
-Read through and analyze:
-- **Problem** - What challenge does this address?
-- **Novelty** - What's genuinely new?
-- **Method** - How do they approach it?
-- **Results** - Key findings and metrics
-- **Impact** - Who benefits? Real-world applications?
-- **Limitations** - Acknowledged gaps or constraints
-- **GitHub/Code** - Search for GitHub links in:
-  - Abstract or introduction (common patterns: "code available at", "github.com/", "open-source")
-  - End of paper ("Code Availability" section)
-  - Footnotes and references
-  - Author homepages mentioned in the paper
-
-Pay special attention to images - they often reveal key insights.
-
----
-
-## Part 4: Write the WeChat Article
-
-Now use my own writing capabilities to transform this content.
-
-### Style Guidelines
-
-**IMPORTANT**: Do NOT add any auto-generated disclaimers or tool credits at the end (e.g., “本文由Paper2WeChat自动生成”).
-
-| Style | Perspective | Tone | Examples |
-|-------|---|---|---|
-| **academic-science** | Rigorous methodology, scientific validity | Careful, structured, evidence-focused | "这项研究采用严谨的科学方法..." |
-| **academic-tech** | Practical applications, engineering solutions | Tech-savvy, forward-looking, actionable | "这个框架解决了工程师们的难题..." |
-| **academic-trend** | Emerging paradigm, market impact | Exciting, future-focused, visionary | "这标志着该领域的重大突破..." |
-| **academic-applied** | Real-world usage, business value | Results-driven, practical, ROI-focused | "实际应用中能带来..." |
-
-### Article Structure
-
-```
-# [Engaging Title - Mix Academic Rigor with Accessibility]
-
-> 📋 **论文信息**
-> - **标题**: [Full Title]
-> - **作者**: [Names]
-> - **单位**: [Institution(s)]
-> - **发表时间**: [Date/Year]
-> - **论文链接**: [Arxiv link]
-> - **开源代码**: [GitHub link] (如果论文开源，否则省略此行)
-
-## 导读 👁️
-
-[2-3 sentences: Why readers should care - personal benefit or industry impact]
-
-## 核心观点 💡
-
-[3-5 key insights, clearly organized:]
-- Main finding
-- Key innovation
-- Practical value
-- Limitation or caveat
-- Future direction
-
-## [Section 2: Methodology/Approach] 🔧
-
-[Explain the approach in accessible language]
-[Use analogies for complex concepts]
-[Connect to existing knowledge]
-
-![Descriptive alt text](../.paper2wechat/images/{paper_id}/page_XXX_YYY.png)
-*图1: 清晰的图注说明，解释这个图表展示的核心内容和价值*
-
-## [Section 3: Results/Impact] 📊
-
-[Present findings with specific metrics]
-[What does the data show?]
-[How does it compare to alternatives?]
-
-![Descriptive alt text](../.paper2wechat/images/{paper_id}/page_XXX_YYY.png)
-*图2: 详细的图注，帮助读者理解数据和实验结果的意义*
-
-## 启示与应用 🚀
-
-[Real-world implications]
-[Who benefits and how?]
-[Potential industry applications]
-[What readers can do with this knowledge]
-
-## 扩展阅读 📚
-
-**IMPORTANT**: Do NOT repeat the paper link or basic info here (already in top section)
-Only include:
-- Related research systems or products (with brief descriptions)
-- Relevant academic works (authors, year, key contribution)
-- Code/datasets if different from main paper
-- Further reading for interested readers
-
-Example:
-- [Related System Name](url) - Brief description
-- Author et al. (Year) - Key contribution
-
-**关键词**: #话题1 #话题2 #话题3
-```
-
-### Writing Principles
-
-1. **Accuracy first** - Never sacrifice correctness for simplicity
-2. **Bridge the gap** - Explain jargon through analogy and example
-3. **Tell a story** - Hook → Problem → Solution → Impact
-4. **Scannable** - Use headings, bullets, and clear structure
-5. **Engaging** - Open with relevance; close with takeaway
-6. **Connected** - Link to reader's world and experience
-7. **Visual context** - Every image needs:
-   - Transitional text before or descriptive context after
-   - Italic caption explaining what the figure shows (*图X: ...*)
-   - Connection to the surrounding narrative
-   - Never insert images abruptly without explanation
-
-### Keyword Requirement
-
-- Always include a **关键词** line using hashtag format at the end of the article.
-- Default to 5-8 tags summarizing topic, method, and application area.
-
-**Translation example:**
-- "Attention mechanisms" → "模型能够像人一样阅读，自动关注重要信息，忽略干扰"
-- "Gradient descent" → "逐步调整参数，像爬山人寻找最低点"
-
----
-
-## Part 5: Create the Output File
-
-Save the generated article as Markdown:
+Use parsed JSON to generate style evidence from paper content (title, abstract, sections, captions):
 
 ```bash
-outputs/{paper_id}.md
+python .claude/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
 ```
 
-The file should start with:
+Rules:
+- Treat script output as evidence, not final style lock.
+- If user explicitly requires a style, user preference overrides all.
+- If `confidence_band` is `high`, usually adopt top candidate.
+- If `confidence_band` is `medium` or `low`, let Agent choose from top-2 or use hybrid style.
+- If top-2 are close, hybrid style is allowed (for example `academic-tech + academic-applied`).
 
-```markdown
----
-title: [Title]
-authors: [Authors]
-arxiv_id: [ID]
-style: [academic-science|academic-tech|academic-trend|academic-applied]
----
+See `references/style-guide.md` for interpretation rules.
 
-# [Title in Chinese]
-...
-```
+## Step 3: Build A Practical Summary
 
----
+Produce a practical summary section before long-form explanation.
+Ensure it answers all items below:
+- 论文解决了什么问题
+- 方法的核心创新是什么
+- 关键结果指标是什么（优先写具体数字）
+- 读者可以直接借鉴的做法是什么
+- 落地边界和风险是什么
 
-## Example Workflow
+Keep this summary scannable with 4-6 bullets.
 
-### Example 1: Simple Request
+## Step 4: Generate The Article
 
-**User:** "Convert this paper to a WeChat article: https://arxiv.org/abs/2301.00000"
+In this skill, article rewriting is done by the Agent directly from parsed JSON.
 
-**Steps:**
-1. ✅ Run: `python -m paper2wechat.core.fetch_cli https://arxiv.org/abs/2301.00000 --verbose`
-2. ✅ Read: `.paper2wechat/parsed/2301_00000.json`
-3. ✅ Intent: Default style (academic-tech), 5000 chars
-4. ✅ Analyze: Understand the paper from JSON
-5. ✅ Write: Article in academic-tech style
-6. ✅ Save: `outputs/2301.00000.md`
+Use `references/article-template.md` as the output scaffold and adapt tone by chosen style.
+Extract useful links directly during writing from parsed JSON text:
+- open-source repo links (GitHub/GitLab/HuggingFace, if present)
+- related papers/resources for further reading
 
-**Output:**
-```
-✅ Article: outputs/2301.00000.md
-📊 Stats: ~4500 chars, 3 images referenced
-🔗 Original: https://arxiv.org/abs/2301.00000
-```
+For image links:
+- default output file is under `.paper2wechat/outputs/`
+- use relative image paths like `../images/<paper_id>/<image_file>`
 
----
+Always include:
+- concise 导读
+- practical summary section
+- method/result sections with context
+- 开源地址（如果论文或项目提供）
+- 扩展阅读（相关研究 + 技术工具/资源）
+- `关键词` hashtag line
 
-### Example 2: Custom Style and Length
+Never add tool-credit disclaimers like “本文由...自动生成”.
 
-**User:** "Turn this PDF into an applied research article, keep it under 3000 chars: paper.pdf"
+## Step 5: Validate Output Quality
 
-**Steps:**
-1. ✅ Run: `python -m paper2wechat.core.fetch_cli ./paper.pdf --verbose`
-2. ✅ Read parsed JSON
-3. ✅ Intent: academic-applied, 3000 chars max
-4. ✅ Analyze with focus on applications
-5. ✅ Write: Concise, practical-oriented article
-6. ✅ Save: `outputs/[stem].md`
+Check the final markdown file:
+- Structure is complete and readable on mobile.
+- Style and tone match requested audience.
+- 2-5 images are inserted with contextual text and captions when available.
+- Claims and numbers align with source content.
+- Output path exists (default: `.paper2wechat/outputs/<paper_id>.md`).
 
----
+## Resources
 
-### Example 3: Emphasize Methodology
-
-**User:** "Convert with academic-science style, focus on methodology details"
-
-**Steps:**
-1. ✅ Extract and parse
-2. ✅ Intent: academic-science, detailed (~6000 chars)
-3. ✅ Pay close attention to Methods section
-4. ✅ Write: Article highlighting methodological rigor
-5. ✅ Save: `outputs/[id].md`
-
----
-
-## Checklist
-
-As you work:
-
-```
-Progress:
-- [ ] Step 1: Run fetch_cli with correct input
-- [ ] Step 1: Verify JSON and images created
-- [ ] Step 2: Extract user intent (style, length, focus)
-- [ ] Step 3: Load and read parsed JSON  
-- [ ] Step 3: Understand core contributions and real-world impact
-- [ ] Step 4: Write article in selected style
-- [ ] Step 4: Follow structure and writing principles
-- [ ] Step 4: Reference extracted images with proper captions (see Image Guidelines below)
-- [ ] Step 4: Add **关键词** line at the end
-- [ ] Step 5: Save to outputs/ with proper naming
-- [ ] Step 5: Report results to user
-```
-
----
-
-## Important Notes
-
-1. **Tool success** - fetch_cli should complete without errors. If it fails:
-   - Check URL format: `https://arxiv.org/abs/YYMM.NNNNN`
-   - For PDFs, ensure file is readable
-   - Check network for Arxiv access
-
-2. **Image handling** - Extracted images are stored locally with captions. Always follow this format:
-   ```markdown
-   ![Descriptive alt text](../.paper2wechat/images/{paper_id}/page_XXX_YYY.png)
-   *图X: 详细的图注说明，解释图表的核心内容和意义*
-   ```
-   **Important:**
-   - Use relative path `../.paper2wechat/...` (not `.paper2wechat/...`) since articles are in outputs/
-   - Always add caption line (斜体图注) below image to provide context
-   - Caption should explain what the figure shows and its significance
-   - Never insert images without context - add transition text before or after
-   - Example caption: *图1: FinSight系统架构展示了数据收集、数据分析和报告生成三个核心阶段的工作流*
-
-3. **Quality depends on:**
-   - Deep understanding of paper (Part 3)
-   - Appropriate style choice (Part 2)
-   - Clear structure and flow (Part 4)
-   - Balance: accuracy > simplicity
-
-4. **Always verify** - The JSON output should have:
-   - Non-empty title and abstract
-   - At least 2-3 sections
-   - Images extracted (usually 3+ for CS papers)
-
----
-
-## Tips for Best Results
-
-1. **Read the abstract first** - Get the big picture
-2. **Study the figures** - Visual layouts reveal key insights
-3. **Identify the core novelty** - What's genuinely new?
-4. **Know your audience** - Academic? Business? General interest?
-5. **Use specific numbers** - Include metrics and results
-6. **Structure matters** - Clear headings and flow
-7. **Hook readers** - First paragraph should explain why they should read
+- `scripts/fetch_paper.sh`: standalone entrypoint to parse paper and extract figures into cache.
+- `scripts/parse_paper.py`: standalone parser with caption-aware figure extraction and fallback strategies.
+- `scripts/detect_style.py`: recommend style from parsed paper content.
+- `references/style-guide.md`: style selection rules and wording constraints.
+- `references/article-template.md`: reusable WeChat article scaffold.
