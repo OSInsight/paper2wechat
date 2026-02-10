@@ -85,6 +85,11 @@ Extract useful links directly during writing from parsed JSON text:
 - open-source repo links (GitHub/GitLab/HuggingFace, if present)
 - related papers/resources for further reading
 
+About `扩展阅读`（相关研究 + 技术工具/资源）:
+- Content should be grounded in the paper as much as possible: prefer items explicitly mentioned in the paper body (related work, baselines, benchmarks/datasets, toolkits, project pages).
+- When possible, add clickable links (arXiv / conference page / project site / GitHub / HuggingFace).
+- If the paper does not provide a link and you cannot reliably identify one, it is OK to omit the link (do not guess).
+
 For image links:
 - default output file is under `.paper2wechat/<paper_id>/outputs/`
 - use relative image paths like `../images/<image_file>`
