@@ -3,7 +3,7 @@
 这个仓库已经调整为 **只服务 skills 工作流**，用于把 Arxiv 论文转换为公众号文章。
 
 技能入口：
-- `.claude/skills/paper2wechat/SKILL.md`
+- `.agents/skills/paper2wechat/SKILL.md`
 
 ## 当前工作流
 
@@ -14,24 +14,24 @@
 1. 解析论文并提取图像：
 
 ```bash
-bash .claude/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv链接或ID或本地PDF>" ".paper2wechat"
+bash .agents/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv链接或ID或本地PDF>" ".paper2wechat"
 ```
 
 2. 基于解析结果生成风格证据（最终风格由 Agent 决策）：
 
 ```bash
-python .claude/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
+python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
 ```
 
 3. 由 Agent 基于解析 JSON 和模板生成公众号文章：
-- 模板：`.claude/skills/paper2wechat/references/article-template.md`
+- 模板：`.agents/skills/paper2wechat/references/article-template.md`
 - 推荐输出路径：`.paper2wechat/outputs/<paper_id>.md`
 - 当文章输出到 `.paper2wechat/outputs` 时，图片链接使用 `../images/<paper_id>/<image_file>`。
 
 ## Skill 目录结构
 
 ```text
-.claude/skills/paper2wechat/
+.agents/skills/paper2wechat/
 ├── SKILL.md
 ├── agents/openai.yaml
 ├── scripts/

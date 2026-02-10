@@ -3,7 +3,7 @@
 This repository is skill-first.
 
 Primary contribution target:
-- `.claude/skills/paper2wechat/`
+- `.agents/skills/paper2wechat/`
 
 ## What To Contribute
 
@@ -27,8 +27,8 @@ pip install -r requirements.txt
 3. End-to-end parse flow works:
 
 ```bash
-bash .claude/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv_url_or_id_or_pdf>" ".paper2wechat"
-python .claude/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
+bash .agents/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv_url_or_id_or_pdf>" ".paper2wechat"
+python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
 ```
 
 4. Workflow descriptions reflect current skill behavior.

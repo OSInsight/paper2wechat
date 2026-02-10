@@ -25,7 +25,7 @@ Optionally accept:
 Run:
 
 ```bash
-bash .claude/skills/paper2wechat/scripts/fetch_paper.sh "<url_or_id_or_pdf>" ".paper2wechat"
+bash .agents/skills/paper2wechat/scripts/fetch_paper.sh "<url_or_id_or_pdf>" ".paper2wechat"
 ```
 
 Expect output lines like:
@@ -48,7 +48,7 @@ If no images are extracted, continue with text-only article and state that figur
 Use parsed JSON to generate style evidence from paper content (title, abstract, sections, captions):
 
 ```bash
-python .claude/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/<paper_id>/parsed/<paper_id>.json" --json
+python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/<paper_id>/parsed/<paper_id>.json" --json
 ```
 
 Rules:

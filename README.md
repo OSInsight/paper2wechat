@@ -3,7 +3,7 @@
 This repository is now maintained as a **skill-first project** for converting Arxiv papers into WeChat-ready articles.
 
 The skill lives at:
-- `.claude/skills/paper2wechat/SKILL.md`
+- `.agents/skills/paper2wechat/SKILL.md`
 
 ## Workflow
 
@@ -14,24 +14,24 @@ This repository uses a skill-driven agent workflow.
 1. Parse paper and extract figures:
 
 ```bash
-bash .claude/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv_url_or_id_or_pdf>" ".paper2wechat"
+bash .agents/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv_url_or_id_or_pdf>" ".paper2wechat"
 ```
 
 2. Generate style evidence from parsed content (Agent makes final style decision):
 
 ```bash
-python .claude/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
+python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
 ```
 
 3. Let agent generate WeChat article from parsed JSON and template:
-- Template: `.claude/skills/paper2wechat/references/article-template.md`
+- Template: `.agents/skills/paper2wechat/references/article-template.md`
 - Recommended output: `.paper2wechat/outputs/<paper_id>.md`
 - When output is under `.paper2wechat/outputs`, image links should use `../images/<paper_id>/<image_file>`.
 
 ## Skill Packaging Layout
 
 ```text
-.claude/skills/paper2wechat/
+.agents/skills/paper2wechat/
 ├── SKILL.md
 ├── agents/openai.yaml
 ├── scripts/
