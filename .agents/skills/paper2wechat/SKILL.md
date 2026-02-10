@@ -32,6 +32,9 @@ Expect output lines like:
 - `Parsed cache: .paper2wechat/<paper_id>/parsed/<paper_id>.json`
 - `Images dir: .paper2wechat/<paper_id>/images`
 
+While running, the parser prints progress logs to stderr (for example download progress and extraction stages).
+For very large PDFs (default: ≥30MB or ≥50 pages), TeX/source fetching may be auto-skipped to avoid long downloads; override with `--source always`.
+
 Image extraction behavior:
 - For arXiv URL/ID: prefer TeX source images first, then fallback to PDF caption-based extraction.
 - For local PDF: use PDF extraction path directly.
@@ -96,11 +99,10 @@ For image count:
 - If user sets `max images`, obey it.
 
 Always include:
+- 论文信息块（标题/作者/机构/论文链接/发布日期/开源地址；优先使用 `affiliations`，缺失时写“未明确注明”，开源地址无则写“未提供”）
 - concise 导读
 - practical summary section
 - method/result sections with context
-- 机构/单位信息（优先使用 `affiliations`，缺失时写“未明确注明”）
-- 开源地址（如果论文或项目提供）
 - 扩展阅读（相关研究 + 技术工具/资源）
 - `关键词` hashtag line
 

@@ -15,6 +15,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -83,6 +84,11 @@ HTTP_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 HTTP_MAX_ATTEMPTS = 4
 HTTP_BACKOFF_BASE_SECONDS = 1.4
 
+# If the PDF is large, prefer skipping TeX/source fetching by default.
+# This avoids long source downloads and huge unpack times on oversized papers.
+AUTO_SKIP_SOURCE_PDF_BYTES = 30 * 1024 * 1024
+AUTO_SKIP_SOURCE_PDF_PAGES = 50
+
 
 class _PDFMinerFontBBoxFilter(logging.Filter):
     """Suppress noisy FontBBox warnings from malformed embedded font descriptors."""
@@ -149,8 +155,19 @@ class FetchError(RuntimeError):
 class PaperFetcher:
     """Fetch paper content from arXiv or local PDF."""
 
-    def __init__(self, cache_dir: str = ".paper2wechat", timeout: int = 30):
+    def __init__(
+        self,
+        cache_dir: str = ".paper2wechat",
+        timeout: int = 30,
+        *,
+        verbose: bool = False,
+        log_interval_seconds: float = 2.0,
+        source_policy: str = "auto",
+    ):
         self.timeout = timeout
+        self.verbose = bool(verbose)
+        self.log_interval_seconds = float(log_interval_seconds)
+        self.source_policy = (source_policy or "auto").strip().lower()
         self.cache_root = Path(cache_dir)
         self.paper_key = ""
         self.paper_dir = self.cache_root
@@ -163,6 +180,12 @@ class PaperFetcher:
         self.last_source_figure_blocks = 0
 
         self.cache_root.mkdir(parents=True, exist_ok=True)
+
+    def _log(self, message: str) -> None:
+        if not self.verbose:
+            return
+        stamp = time.strftime("%H:%M:%S")
+        print(f"[paper2wechat {stamp}] {message}", file=sys.stderr, flush=True)
 
     @staticmethod
     def _safe_key(value: str) -> str:
@@ -186,14 +209,19 @@ class PaperFetcher:
     def fetch_from_url(self, url: str) -> Paper:
         arxiv_id = self.parse_arxiv_url(url)
         self._activate_paper_workspace(arxiv_id)
+        self._log(f"Input: arXiv {arxiv_id}")
         try:
+            self._log("Fetching metadata (API/abs fallback)...")
             metadata = self._fetch_arxiv_metadata(arxiv_id)
         except FetchError:
+            self._log("Metadata fetch failed; continuing with PDF-only parsing.")
             metadata = {}
 
         pdf_url = metadata.get("pdf_url") or f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+        self._log(f"Ensuring PDF cached: {pdf_url}")
         pdf_path = self._download_pdf(pdf_url, arxiv_id)
 
+        self._log(f"Parsing PDF: {pdf_path.as_posix()}")
         paper = self.fetch_from_pdf(
             str(pdf_path),
             arxiv_id=arxiv_id,
@@ -222,6 +250,7 @@ class PaperFetcher:
             raise FileNotFoundError(f"PDF not found: {pdf_file}")
         cache_key = arxiv_id or pdf_file.stem
         self._activate_paper_workspace(cache_key)
+        self._log(f"Workspace: {self.paper_dir.as_posix()}")
 
         try:
             from pypdf import PdfReader
@@ -233,6 +262,15 @@ class PaperFetcher:
         except Exception as exc:
             raise FetchError(f"Unable to read PDF: {pdf_file}") from exc
 
+        total_pages = len(getattr(reader, "pages", []) or [])
+        self._log(f"PDF loaded: {total_pages} pages")
+        try:
+            pdf_bytes = int(pdf_file.stat().st_size)
+        except Exception:
+            pdf_bytes = 0
+        if pdf_bytes:
+            self._log(f"PDF size: {pdf_bytes/1e6:.1f}MB")
+
         metadata = reader.metadata or {}
         title = self._clean_text(str(metadata.get("/Title", "") or "").strip())
         if not title:
@@ -243,7 +281,13 @@ class PaperFetcher:
         )
 
         page_lines_by_page: List[List[str]] = []
-        for page in reader.pages:
+        start_extract = time.monotonic()
+        last_page_log = start_extract
+        for index, page in enumerate(reader.pages, start=1):
+            now = time.monotonic()
+            if self.verbose and (now - last_page_log) >= self.log_interval_seconds:
+                self._log(f"Extracting text: page {index}/{total_pages}")
+                last_page_log = now
             text = page.extract_text() or ""
             clean = self._normalize_page_text(text)
             lines = [line.strip() for line in clean.splitlines() if line.strip()]
@@ -276,13 +320,40 @@ class PaperFetcher:
         abstract = self._extract_abstract(full_text)
         self.last_image_backend = "none"
         images: List[ImageInfo] = []
+
+        should_try_source = False
         if arxiv_id:
+            policy = self.source_policy
+            if policy in {"never", "no", "false", "0"}:
+                should_try_source = False
+            elif policy in {"always", "yes", "true", "1"}:
+                should_try_source = True
+            else:
+                # auto
+                oversized = (pdf_bytes and pdf_bytes >= AUTO_SKIP_SOURCE_PDF_BYTES) or (
+                    total_pages and total_pages >= AUTO_SKIP_SOURCE_PDF_PAGES
+                )
+                should_try_source = not oversized
+                if oversized:
+                    reasons: List[str] = []
+                    if pdf_bytes and pdf_bytes >= AUTO_SKIP_SOURCE_PDF_BYTES:
+                        reasons.append(f"size {pdf_bytes/1e6:.1f}MB >= {AUTO_SKIP_SOURCE_PDF_BYTES/1e6:.0f}MB")
+                    if total_pages and total_pages >= AUTO_SKIP_SOURCE_PDF_PAGES:
+                        reasons.append(f"pages {total_pages} >= {AUTO_SKIP_SOURCE_PDF_PAGES}")
+                    reason_text = ", ".join(reasons) if reasons else "oversized PDF"
+                    self.last_source_status = f"auto-skip source ({reason_text})"
+                    self._log(f"Auto-skip TeX/source extraction: {reason_text}")
+
+        if arxiv_id and should_try_source:
+            self._log("Trying TeX-source figure extraction...")
             images = self._extract_images_from_arxiv_source(
                 arxiv_id=arxiv_id,
                 cache_key=cache_key,
             )
             if images:
+                self._log(f"TeX-source images: {len(images)} (figure blocks: {self.last_source_figure_blocks})")
                 if self.last_source_figure_blocks > len(images):
+                    self._log("Supplementing with PDF figures (missing TeX assets)...")
                     images = self._supplement_source_images_with_pdf(
                         source_images=images,
                         pdf_path=pdf_file,
@@ -291,7 +362,10 @@ class PaperFetcher:
                     )
                 if self.last_image_backend != "tex-source+pdf-supplement":
                     self.last_image_backend = "tex-source"
+            else:
+                self._log(f"TeX-source extraction yielded 0 images ({self.last_source_status or 'no status'}).")
         if not images:
+            self._log("Trying PDF caption-based extraction...")
             images = self._extract_figures_by_caption(
                 pdf_path=pdf_file,
                 cache_key=cache_key,
@@ -299,6 +373,7 @@ class PaperFetcher:
             if images:
                 self.last_image_backend = "pdf-caption"
         if not images:
+            self._log("Trying PDFPlumber-based extraction...")
             images = self._extract_figures_with_pdfplumber(
                 pdf_path=pdf_file,
                 cache_key=cache_key,
@@ -306,6 +381,7 @@ class PaperFetcher:
             if images:
                 self.last_image_backend = "pdf-plumber"
         if not images:
+            self._log("Trying PyMuPDF (fitz) largest-figure extraction...")
             images = self._extract_largest_figures_with_fitz(
                 pdf_path=pdf_file,
                 cache_key=cache_key,
@@ -314,9 +390,12 @@ class PaperFetcher:
             if images:
                 self.last_image_backend = "pdf-fitz-largest"
         if not images:
+            self._log("Trying embedded-image extraction...")
             images = self._extract_pdf_images(reader, cache_key=cache_key)
             if images:
                 self.last_image_backend = "pdf-embedded"
+
+        self._log(f"Image backend: {self.last_image_backend} (images: {len(images)})")
 
         paper = Paper(
             title=title,
@@ -358,7 +437,9 @@ class PaperFetcher:
 
         for api_url in api_urls:
             try:
-                xml_text = self._http_get(api_url).decode("utf-8", errors="replace")
+                # arXiv API endpoints are frequently rate-limited (HTTP 429). We keep retries
+                # low here and fall back to parsing the abs HTML page if needed.
+                xml_text = self._http_get(api_url, max_attempts=1).decode("utf-8", errors="replace")
             except FetchError as exc:
                 last_error = exc
                 continue
@@ -562,17 +643,37 @@ class PaperFetcher:
         safe_id = arxiv_id.replace("/", "_")
         output_path = self.download_dir / f"{safe_id}.pdf"
         if output_path.exists() and output_path.stat().st_size > 0:
-            return output_path
+            try:
+                with output_path.open("rb") as handle:
+                    head = handle.read(512)
+            except Exception:
+                head = b""
+            if head.startswith(b"%PDF") and not self._looks_like_html_payload(head):
+                self._log(f"PDF cached: {output_path.as_posix()} ({output_path.stat().st_size} bytes)")
+                return output_path
+            self._log("PDF cache looks invalid; re-downloading.")
+            output_path.unlink(missing_ok=True)
 
-        pdf_bytes = self._http_get(pdf_url)
-        output_path.write_bytes(pdf_bytes)
+        self._http_download_to_file(
+            pdf_url,
+            output_path,
+            description=f"PDF {arxiv_id}",
+        )
         return output_path
 
     def _download_arxiv_source(self, arxiv_id: str) -> Optional[Path]:
         safe_id = arxiv_id.replace("/", "_")
         output_path = self.download_dir / f"{safe_id}-source.bin"
         if output_path.exists() and output_path.stat().st_size > 0:
-            return output_path
+            try:
+                head = output_path.read_bytes()[:512]
+            except Exception:
+                head = b""
+            if head and not self._looks_like_html_payload(head):
+                self._log(f"Source cached: {output_path.as_posix()} ({output_path.stat().st_size} bytes)")
+                return output_path
+            self._log("Source cache looks invalid; re-downloading.")
+            output_path.unlink(missing_ok=True)
 
         source_urls = [
             f"https://arxiv.org/src/{arxiv_id}",
@@ -580,12 +681,20 @@ class PaperFetcher:
         ]
         for source_url in source_urls:
             try:
-                source_bytes = self._http_get(source_url)
+                self._http_download_to_file(
+                    source_url,
+                    output_path,
+                    description=f"arXiv source {arxiv_id}",
+                )
             except FetchError:
                 continue
-            if not source_bytes or self._looks_like_html_payload(source_bytes):
+            try:
+                source_bytes = output_path.read_bytes()
+            except Exception:
                 continue
-            output_path.write_bytes(source_bytes)
+            if not source_bytes or self._looks_like_html_payload(source_bytes):
+                output_path.unlink(missing_ok=True)
+                continue
             return output_path
 
         return None
@@ -1254,25 +1363,30 @@ class PaperFetcher:
             encoding="utf-8",
         )
 
-    def _http_get(self, url: str) -> bytes:
+    def _http_get(self, url: str, *, max_attempts: int = HTTP_MAX_ATTEMPTS) -> bytes:
+        max_attempts = max(1, int(max_attempts))
         headers = {"User-Agent": "paper2wechat-skill/1.0"}
 
         if requests is not None:
             last_error: Optional[Exception] = None
-            for attempt in range(1, HTTP_MAX_ATTEMPTS + 1):
+            for attempt in range(1, max_attempts + 1):
                 try:
+                    self._log(f"HTTP GET (attempt {attempt}/{max_attempts}): {url}")
                     response = requests.get(url, headers=headers, timeout=self.timeout)
                 except Exception as exc:
                     last_error = exc
-                    if attempt >= HTTP_MAX_ATTEMPTS:
+                    self._log(f"HTTP error: {type(exc).__name__}: {exc}")
+                    if attempt >= max_attempts:
                         break
                     time.sleep(self._compute_retry_delay(attempt=attempt))
                     continue
 
                 if response.status_code < 400:
+                    self._log(f"HTTP {response.status_code}: {url} ({len(response.content)} bytes)")
                     return response.content
 
-                if response.status_code in HTTP_RETRY_STATUS_CODES and attempt < HTTP_MAX_ATTEMPTS:
+                if response.status_code in HTTP_RETRY_STATUS_CODES and attempt < max_attempts:
+                    self._log(f"HTTP {response.status_code}, retrying: {url}")
                     time.sleep(
                         self._compute_retry_delay(
                             attempt=attempt,
@@ -1290,14 +1404,18 @@ class PaperFetcher:
 
         request = urllib.request.Request(url, headers=headers)
         last_error: Optional[Exception] = None
-        for attempt in range(1, HTTP_MAX_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             try:
+                self._log(f"HTTP GET (attempt {attempt}/{max_attempts}): {url}")
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    return response.read()
+                    payload = response.read()
+                    self._log(f"HTTP 200: {url} ({len(payload)} bytes)")
+                    return payload
             except urllib.error.HTTPError as exc:  # pragma: no cover
                 last_error = exc
-                if exc.code in HTTP_RETRY_STATUS_CODES and attempt < HTTP_MAX_ATTEMPTS:
+                if exc.code in HTTP_RETRY_STATUS_CODES and attempt < max_attempts:
                     retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+                    self._log(f"HTTP {exc.code}, retrying: {url}")
                     time.sleep(
                         self._compute_retry_delay(
                             attempt=attempt,
@@ -1308,12 +1426,142 @@ class PaperFetcher:
                 raise FetchError(f"Request failed: {url}") from exc
             except urllib.error.URLError as exc:  # pragma: no cover
                 last_error = exc
-                if attempt >= HTTP_MAX_ATTEMPTS:
+                self._log(f"HTTP error: {type(exc).__name__}: {exc}")
+                if attempt >= max_attempts:
                     break
                 time.sleep(self._compute_retry_delay(attempt=attempt))
                 continue
 
         raise FetchError(f"Request failed: {url}") from last_error
+
+    def _http_download_to_file(self, url: str, output_path: Path, *, description: str) -> None:
+        headers = {"User-Agent": "paper2wechat-skill/1.0"}
+        tmp_path = output_path.with_suffix(output_path.suffix + ".part")
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _log_progress(downloaded: int, total: int, started_at: float, prefix: str) -> None:
+            if not self.verbose:
+                return
+            elapsed = max(1e-6, time.monotonic() - started_at)
+            rate = downloaded / elapsed
+            if total > 0:
+                pct = downloaded / total * 100
+                self._log(
+                    f"{prefix}: {downloaded/1e6:.1f}MB/{total/1e6:.1f}MB ({pct:.1f}%) at {rate/1e6:.2f}MB/s"
+                )
+            else:
+                self._log(f"{prefix}: {downloaded/1e6:.1f}MB downloaded at {rate/1e6:.2f}MB/s")
+
+        self._log(f"Downloading {description}: {url}")
+        started_at = time.monotonic()
+        last_log = started_at
+
+        try:
+            if requests is not None:
+                last_error: Optional[Exception] = None
+                for attempt in range(1, HTTP_MAX_ATTEMPTS + 1):
+                    try:
+                        self._log(f"HTTP stream (attempt {attempt}/{HTTP_MAX_ATTEMPTS}): {url}")
+                        response = requests.get(
+                            url,
+                            headers=headers,
+                            timeout=self.timeout,
+                            stream=True,
+                        )
+                    except Exception as exc:
+                        last_error = exc
+                        self._log(f"HTTP error: {type(exc).__name__}: {exc}")
+                        if attempt >= HTTP_MAX_ATTEMPTS:
+                            break
+                        time.sleep(self._compute_retry_delay(attempt=attempt))
+                        continue
+
+                    try:
+                        if response.status_code >= 400:
+                            if response.status_code in HTTP_RETRY_STATUS_CODES and attempt < HTTP_MAX_ATTEMPTS:
+                                self._log(f"HTTP {response.status_code}, retrying: {url}")
+                                time.sleep(
+                                    self._compute_retry_delay(
+                                        attempt=attempt,
+                                        retry_after=response.headers.get("Retry-After", ""),
+                                    )
+                                )
+                                continue
+                            response.raise_for_status()
+
+                        total = int(response.headers.get("Content-Length", "0") or 0)
+                        downloaded = 0
+                        with tmp_path.open("wb") as handle:
+                            for chunk in response.iter_content(chunk_size=128 * 1024):
+                                if not chunk:
+                                    continue
+                                handle.write(chunk)
+                                downloaded += len(chunk)
+                                now = time.monotonic()
+                                if self.verbose and (now - last_log) >= self.log_interval_seconds:
+                                    _log_progress(downloaded, total, started_at, description)
+                                    last_log = now
+                    finally:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+
+                    if tmp_path.stat().st_size <= 0:
+                        raise FetchError(f"Downloaded empty payload: {url}")
+                    tmp_path.replace(output_path)
+                    self._log(f"Downloaded {description}: {output_path.as_posix()} ({output_path.stat().st_size} bytes)")
+                    return
+
+                raise FetchError(f"Request failed: {url}") from last_error
+
+            request = urllib.request.Request(url, headers=headers)
+            last_error: Optional[Exception] = None
+            for attempt in range(1, HTTP_MAX_ATTEMPTS + 1):
+                try:
+                    self._log(f"HTTP stream (attempt {attempt}/{HTTP_MAX_ATTEMPTS}): {url}")
+                    with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                        total = int(getattr(response, "length", 0) or response.headers.get("Content-Length", "0") or 0)
+                        downloaded = 0
+                        with tmp_path.open("wb") as handle:
+                            while True:
+                                chunk = response.read(128 * 1024)
+                                if not chunk:
+                                    break
+                                handle.write(chunk)
+                                downloaded += len(chunk)
+                                now = time.monotonic()
+                                if self.verbose and (now - last_log) >= self.log_interval_seconds:
+                                    _log_progress(downloaded, total, started_at, description)
+                                    last_log = now
+                except urllib.error.HTTPError as exc:  # pragma: no cover
+                    last_error = exc
+                    if exc.code in HTTP_RETRY_STATUS_CODES and attempt < HTTP_MAX_ATTEMPTS:
+                        retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+                        self._log(f"HTTP {exc.code}, retrying: {url}")
+                        time.sleep(self._compute_retry_delay(attempt=attempt, retry_after=retry_after))
+                        continue
+                    raise FetchError(f"Request failed: {url}") from exc
+                except urllib.error.URLError as exc:  # pragma: no cover
+                    last_error = exc
+                    self._log(f"HTTP error: {type(exc).__name__}: {exc}")
+                    if attempt >= HTTP_MAX_ATTEMPTS:
+                        break
+                    time.sleep(self._compute_retry_delay(attempt=attempt))
+                    continue
+
+                if tmp_path.exists() and tmp_path.stat().st_size > 0:
+                    tmp_path.replace(output_path)
+                    self._log(f"Downloaded {description}: {output_path.as_posix()} ({output_path.stat().st_size} bytes)")
+                    return
+
+            raise FetchError(f"Request failed: {url}") from last_error
+        finally:
+            if tmp_path.exists() and not output_path.exists():
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     @staticmethod
     def _compute_retry_delay(attempt: int, retry_after: str = "") -> float:
@@ -2618,10 +2866,26 @@ def main() -> None:
     parser.add_argument("input", help="Arxiv URL/ID or local PDF path")
     parser.add_argument("--cache-dir", default=".paper2wechat", help="Cache directory")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--source",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Whether to fetch arXiv TeX/source for figure extraction (default: auto)",
+    )
     args = parser.parse_args()
 
     mode, arxiv_id, local_pdf = parse_input(args.input.strip())
-    fetcher = PaperFetcher(cache_dir=args.cache_dir)
+    fetcher = PaperFetcher(
+        cache_dir=args.cache_dir,
+        verbose=args.verbose,
+        source_policy=args.source,
+    )
+
+    if args.verbose:
+        if mode == "arxiv":
+            print(f"Mode: arXiv ({arxiv_id})", file=sys.stderr, flush=True)
+        else:
+            print(f"Mode: PDF ({local_pdf})", file=sys.stderr, flush=True)
 
     if mode == "arxiv":
         assert arxiv_id is not None
