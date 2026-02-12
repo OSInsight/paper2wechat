@@ -5,6 +5,7 @@
 技能入口：
 - `.agents/skills/paper2wechat/SKILL.md`
 - `.agents/skills/wechat-publisher/SKILL.md`
+- `.agents/skills/paper2wechat-pipeline/SKILL.md`
 
 ## 当前工作流
 
@@ -12,6 +13,7 @@
 
 - `paper2wechat`：负责论文解析与文章生成
 - `wechat-publisher`：负责 markdown 转公众号富文本、图片上传、草稿创建
+- `paper2wechat-pipeline`：负责一条龙编排（解析→风格证据→发布）
 
 ## 快速开始（Skill 工作流）
 
@@ -53,6 +55,32 @@ python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed
 │   └── publish_wechat.py
 └── references/
         └── config-example.env
+
+.agents/skills/paper2wechat-pipeline/
+├── SKILL.md
+├── agents/openai.yaml
+└── scripts/
+        └── run_pipeline.py
+```
+
+## 一条龙编排（paper2wechat-pipeline）
+
+```bash
+python .agents/skills/paper2wechat-pipeline/scripts/run_pipeline.py \
+    --paper "2602.09013" \
+    --theme ai-insight \
+    --upload-images
+```
+
+可选自动建草稿：
+
+```bash
+python .agents/skills/paper2wechat-pipeline/scripts/run_pipeline.py \
+    --paper "2602.09013" \
+    --theme ai-insight \
+    --upload-images \
+    --create-draft \
+    --auto-thumb
 ```
 
 ## 独立发布器（wechat-publisher）快速开始
