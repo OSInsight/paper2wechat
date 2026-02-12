@@ -4,10 +4,14 @@
 
 技能入口：
 - `.agents/skills/paper2wechat/SKILL.md`
+- `.agents/skills/wechat-publisher/SKILL.md`
 
 ## 当前工作流
 
 本仓库使用基于 skill 的 Agent 工作流。
+
+- `paper2wechat`：负责论文解析与文章生成
+- `wechat-publisher`：负责 markdown 转公众号富文本、图片上传、草稿创建
 
 ## 快速开始（Skill 工作流）
 
@@ -41,7 +45,50 @@ python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed
 └── references/
     ├── style-guide.md
     └── article-template.md
+
+.agents/skills/wechat-publisher/
+├── SKILL.md
+├── agents/openai.yaml
+├── scripts/
+│   └── publish_wechat.py
+└── references/
+        └── config-example.env
 ```
+
+## 独立发布器（wechat-publisher）快速开始
+
+1. 仅转换为可粘贴公众号富文本页面：
+
+```bash
+python .agents/skills/wechat-publisher/scripts/publish_wechat.py \
+    --input-md ".paper2wechat/<paper_id>/outputs/<paper_id>.md"
+```
+
+2. 上传本地图片到公众号图床并替换正文图片链接：
+
+```bash
+WECHAT_APP_ID="..." WECHAT_APP_SECRET="..." \
+python .agents/skills/wechat-publisher/scripts/publish_wechat.py \
+    --input-md ".paper2wechat/<paper_id>/outputs/<paper_id>.md" \
+    --upload-images
+```
+
+3. 可选：创建公众号草稿（需要封面 `thumb_media_id`）：
+
+```bash
+WECHAT_APP_ID="..." WECHAT_APP_SECRET="..." \
+python .agents/skills/wechat-publisher/scripts/publish_wechat.py \
+    --input-md ".paper2wechat/<paper_id>/outputs/<paper_id>.md" \
+    --upload-images \
+    --create-draft \
+    --thumb-media-id "<thumb_media_id>"
+```
+
+默认输出：
+- `.paper2wechat/<paper_id>/outputs/<paper_id>.wechat.html`
+- `.paper2wechat/<paper_id>/outputs/<paper_id>.wechat.paste.html`
+- `.paper2wechat/<paper_id>/outputs/image-map.json`（上传图片时）
+- `.paper2wechat/<paper_id>/outputs/publish-result.json`（创建草稿时）
 
 ## 运行依赖
 
@@ -50,6 +97,8 @@ python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed
 - `pdfplumber`
 - `PyMuPDF`（可选但推荐，用于更稳健图像提取）
 - `Pillow`
+- `requests`
+- `Markdown`
 
 ## 面向 Skills 广场发布的注意点
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "WeChat Publisher"
+  short_description: "Convert local markdown to WeChat rich text and optionally publish draft"
+  default_prompt: "Use $wechat-publisher to convert .paper2wechat/<paper_id>/outputs/<paper_id>.md into WeChat-ready rich text HTML, upload local images if credentials are provided, and optionally create a draft article in WeChat Official Account backend."

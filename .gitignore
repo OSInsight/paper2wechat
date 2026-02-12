@@ -144,3 +144,4 @@ articles/
 *.pyc
 .env.local
 config.local.yaml
+.wechat-token.json
