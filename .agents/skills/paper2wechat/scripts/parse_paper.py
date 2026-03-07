@@ -70,7 +70,7 @@ BROAD_SIDE_PAD_RATIO = 0.028
 BROAD_PAD_X_SCALE = 0.055
 BROAD_PAD_Y_SCALE = 0.045
 
-MAX_SOURCE_IMAGES = 12
+MAX_SOURCE_IMAGES = 100  # Increased limit to avoid missing important figures
 SOURCE_MIN_BYTES = 12 * 1024
 SOURCE_MIN_WIDTH_PX = 160
 SOURCE_MIN_HEIGHT_PX = 160
@@ -1094,6 +1094,12 @@ class PaperFetcher:
         score = min(size / (256 * 1024), 12.0)
         if "fig" in name or "figure" in name:
             score += 3.5
+        # Highest priority for Figure 1 (main pipeline/overview figures)
+        if "figure1" in name or "fig1" in name:
+            score += 5.0  # Boost Figure 1 to ensure it's extracted first
+        # Boost for pipeline/framework/overview content
+        if "pipeline" in name or "framework" in name or "overview" in name:
+            score += 4.0
         if "logo" in name or "icon" in name or "banner" in name:
             score -= 3.0
         if extension in SOURCE_RASTER_EXTENSIONS:
