@@ -41,6 +41,11 @@ try:
 except Exception:  # pragma: no cover
     fitz = None
 
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover
+    Image = None
+
 
 ARXIV_ID_PATTERN = re.compile(
     r"(?P<id>(\d{4}\.\d{4,5}|[a-z\-]+/\d{7})(v\d+)?)",
@@ -67,6 +72,11 @@ BROAD_PAD_Y_SCALE = 0.045
 
 MAX_SOURCE_IMAGES = 12
 SOURCE_MIN_BYTES = 12 * 1024
+SOURCE_MIN_WIDTH_PX = 160
+SOURCE_MIN_HEIGHT_PX = 160
+SOURCE_SLIM_ASPECT_RATIO = 18.0
+SOURCE_LEGEND_ASPECT_RATIO = 4.0
+SOURCE_LEGEND_NAME_TOKENS = ("legend", "icon", "logo", "banner")
 SOURCE_RASTER_EXTENSIONS = (
     ".png",
     ".jpg",
@@ -1111,11 +1121,17 @@ class PaperFetcher:
                 shutil.copy2(source_path, output_path)
             except Exception:
                 return None
+            if not self._validate_source_image_shape(output_path, source_path.name):
+                output_path.unlink(missing_ok=True)
+                return None
             return output_path
 
         if extension in SOURCE_VECTOR_EXTENSIONS:
             output_path = output_dir / f"source_{sequence:03d}.png"
             if self._rasterize_pdf_with_pdftoppm(source_path=source_path, output_path=output_path):
+                if not self._validate_source_image_shape(output_path, source_path.name):
+                    output_path.unlink(missing_ok=True)
+                    return None
                 return output_path
             if fitz is not None:
                 try:
@@ -1132,11 +1148,48 @@ class PaperFetcher:
                         document.close()
                 except Exception:
                     return None
+                if not self._validate_source_image_shape(output_path, source_path.name):
+                    output_path.unlink(missing_ok=True)
+                    return None
                 return output_path
             if self._rasterize_pdf_with_sips(source_path=source_path, output_path=output_path):
+                if not self._validate_source_image_shape(output_path, source_path.name):
+                    output_path.unlink(missing_ok=True)
+                    return None
                 return output_path
 
         return None
+
+    @staticmethod
+    def _validate_source_image_shape(image_path: Path, source_name: str) -> bool:
+        if Image is None:
+            return True
+        try:
+            with Image.open(image_path) as image:
+                width, height = image.size
+        except Exception:
+            return False
+
+        if width < SOURCE_MIN_WIDTH_PX or height < SOURCE_MIN_HEIGHT_PX:
+            return False
+
+        longer = float(max(width, height))
+        shorter = float(max(1, min(width, height)))
+        aspect_ratio = longer / shorter
+
+        # Remove stripe-like assets (often legends/colorbars/icons) commonly present
+        # as auxiliary includegraphics entries in LaTeX figures.
+        if aspect_ratio >= SOURCE_SLIM_ASPECT_RATIO and shorter <= 220:
+            return False
+
+        lower_name = (source_name or "").lower()
+        if any(token in lower_name for token in SOURCE_LEGEND_NAME_TOKENS):
+            if aspect_ratio >= SOURCE_LEGEND_ASPECT_RATIO:
+                return False
+            if shorter <= 220:
+                return False
+
+        return True
 
     @staticmethod
     def _rasterize_pdf_with_pdftoppm(source_path: Path, output_path: Path) -> bool:

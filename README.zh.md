@@ -26,13 +26,28 @@ bash .agents/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv链接或ID或本
 2. 基于解析结果生成风格证据（最终风格由 Agent 决策）：
 
 ```bash
-python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
+python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/<paper_id>/parsed/<paper_id>.json" --json
 ```
 
 3. 由 Agent 基于解析 JSON 和模板生成公众号文章：
 - 模板：`.agents/skills/paper2wechat/references/article-template.md`
-- 推荐输出路径：`.paper2wechat/outputs/<paper_id>.md`
-- 当文章输出到 `.paper2wechat/outputs` 时，图片链接使用 `../images/<paper_id>/<image_file>`。
+- 推荐输出路径：`.paper2wechat/<paper_id>/outputs/<paper_id>.md`
+- 当文章输出到 `.paper2wechat/<paper_id>/outputs` 时，图片链接使用 `../images/<image_file>`。
+
+4. （可选）在 markdown 已存在后，执行 pipeline 发布阶段：
+
+```bash
+python .agents/skills/paper2wechat-pipeline/scripts/run_pipeline.py \
+    --paper "<arxiv链接或ID或本地PDF>" \
+    --upload-images \
+    --create-draft \
+    --auto-thumb
+```
+
+Pipeline 行为说明：
+- `run_pipeline.py` 负责串联解析/风格证据/发布脚本。
+- 它不会自动生成文章 markdown 内容。
+- 如果 markdown 缺失，会停止并提示先生成 `.paper2wechat/<paper_id>/outputs/<paper_id>.md`。
 
 ## Skill 目录结构
 
@@ -64,6 +79,8 @@ python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed
 ```
 
 ## 一条龙编排（paper2wechat-pipeline）
+
+说明：以下命令用于“编排 + 发布”。若 markdown 尚未生成，pipeline 会提示先完成文章写作步骤。
 
 ```bash
 python .agents/skills/paper2wechat-pipeline/scripts/run_pipeline.py \

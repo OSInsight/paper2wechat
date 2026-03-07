@@ -129,6 +129,12 @@ def main() -> int:
     )
     if not article_md.exists():
         print("[pipeline] article markdown missing, stop before publish step.")
+        print(
+            "[hint] run_pipeline.py only orchestrates parse/style/publish scripts and does not auto-write article markdown."
+        )
+        print(
+            "[hint] please run the paper2wechat writing step (Agent/skill) to generate the markdown first."
+        )
         print(f"[next] write article markdown at: {article_md}")
         print("[next] then re-run this command with same args (or pass --article-md).")
         return 0

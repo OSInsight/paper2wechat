@@ -10,6 +10,8 @@ Use this skill as the orchestration layer over existing skills:
 - `paper2wechat` for parsing + article writing
 - `wechat-publisher` for rendering + image upload + draft creation
 
+Important: `run_pipeline.py` itself does **not** auto-generate article markdown content. Markdown writing is done by the Agent using `paper2wechat` skill, then pipeline continues publish steps.
+
 ## Inputs
 
 Required:
@@ -37,7 +39,7 @@ python .agents/skills/paper2wechat-pipeline/scripts/run_pipeline.py \
 2. Run style evidence script via `paper2wechat/scripts/detect_style.py`.
 3. Resolve expected article markdown path (`.paper2wechat/<paper_id>/outputs/<paper_id>.md`).
 4. If markdown exists, call `wechat-publisher/scripts/publish_wechat.py`.
-5. If markdown is missing, report parse/style outputs and stop with actionable guidance.
+5. If markdown is missing, report parse/style outputs and stop with actionable guidance to run `paper2wechat` writing step first.
 
 ## Notes
 

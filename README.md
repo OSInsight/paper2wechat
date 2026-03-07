@@ -20,13 +20,28 @@ bash .agents/skills/paper2wechat/scripts/fetch_paper.sh "<arxiv_url_or_id_or_pdf
 2. Generate style evidence from parsed content (Agent makes final style decision):
 
 ```bash
-python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/parsed/<paper_id>.json" --json
+python .agents/skills/paper2wechat/scripts/detect_style.py ".paper2wechat/<paper_id>/parsed/<paper_id>.json" --json
 ```
 
 3. Let agent generate WeChat article from parsed JSON and template:
 - Template: `.agents/skills/paper2wechat/references/article-template.md`
-- Recommended output: `.paper2wechat/outputs/<paper_id>.md`
-- When output is under `.paper2wechat/outputs`, image links should use `../images/<paper_id>/<image_file>`.
+- Recommended output: `.paper2wechat/<paper_id>/outputs/<paper_id>.md`
+- When output is under `.paper2wechat/<paper_id>/outputs`, image links should use `../images/<image_file>`.
+
+4. (Optional) Run pipeline publish stage after markdown exists:
+
+```bash
+python .agents/skills/paper2wechat-pipeline/scripts/run_pipeline.py \
+    --paper "<arxiv_url_or_id_or_pdf>" \
+    --upload-images \
+    --create-draft \
+    --auto-thumb
+```
+
+Pipeline behavior summary:
+- `run_pipeline.py` orchestrates parse/style/publish scripts.
+- It does **not** auto-write article markdown content.
+- If markdown is missing, it stops and prompts you to generate `.paper2wechat/<paper_id>/outputs/<paper_id>.md` first.
 
 ## Skill Packaging Layout
 
